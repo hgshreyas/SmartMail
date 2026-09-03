@@ -27,6 +27,8 @@ public class Email {
 
     private boolean processed;
 
+    private boolean aiReviewed;
+
     public Email() {
     }
 
@@ -96,5 +98,13 @@ public class Email {
 
     public void setProcessed(boolean processed) {
         this.processed = processed;
+    }
+
+    public boolean isAiReviewed() {
+        return aiReviewed;
+    }
+
+    public void setAiReviewed(boolean aiReviewed) {
+        this.aiReviewed = aiReviewed;
     }
 }

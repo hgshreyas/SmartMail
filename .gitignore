@@ -1,0 +1,13 @@
+# Local configuration / secrets
+backend/src/main/resources/application-local.properties
+
+# Build output
+backend/target/
+
+# IDE
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
