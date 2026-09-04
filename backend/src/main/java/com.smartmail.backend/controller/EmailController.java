@@ -53,15 +53,15 @@ public class EmailController {
      * This does NOT fetch Gmail.
      * This does NOT run Ollama.
      * It only returns the latest results stored in PostgreSQL.
-     *
-     * The frontend will use this endpoint to get updated
-     * classification results after the asynchronous AI review finishes.
      */
     @GetMapping("/gmail/results")
     public List<Email> getGmailResults() {
         return emailRepository.findAll();
     }
 
+    /*
+     * Add an email manually.
+     */
     @PostMapping
     public Email addEmail(@RequestBody Email email) {
 
@@ -70,11 +70,55 @@ public class EmailController {
         return emailRepository.save(email);
     }
 
+    /*
+     * Get one email by database ID.
+     */
     @GetMapping("/{id}")
     public Email getEmail(@PathVariable Long id) {
         return emailRepository.findById(id).orElse(null);
     }
 
+    /*
+     * Human review:
+     *
+     * Keep the email.
+     *
+     * This updates both Gmail and PostgreSQL.
+     */
+    @PostMapping("/{id}/keep")
+    public Email keepEmail(
+            @PathVariable Long id,
+            @RegisteredOAuth2AuthorizedClient("google")
+            OAuth2AuthorizedClient authorizedClient) {
+
+        return gmailService.keepEmail(
+                authorizedClient,
+                id
+        );
+    }
+
+    /*
+     * Human review:
+     *
+     * Move the email to Gmail Trash.
+     *
+     * This updates both Gmail and PostgreSQL.
+     */
+    @PostMapping("/{id}/trash")
+    public Email trashEmail(
+            @PathVariable Long id,
+            @RegisteredOAuth2AuthorizedClient("google")
+            OAuth2AuthorizedClient authorizedClient) {
+
+        return gmailService.trashEmail(
+                authorizedClient,
+                id
+        );
+    }
+
+    /*
+     * Delete an email from the SmartMail database.
+     */
     @DeleteMapping("/{id}")
     public void deleteEmail(@PathVariable Long id) {
         emailRepository.deleteById(id);

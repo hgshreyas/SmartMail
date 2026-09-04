@@ -19,7 +19,7 @@ import org.springframework.stereotype.Service;
 @Service
 public class EmailClassifierService {
 
-    private final GeminiClassificationService geminiClassificationService;
+    private final OllamaClassificationService ollamaClassificationService;
     private final EmailRepository emailRepository;
 
     /*
@@ -32,10 +32,10 @@ public class EmailClassifierService {
             ConcurrentHashMap.newKeySet();
 
     public EmailClassifierService(
-            GeminiClassificationService geminiClassificationService,
+            OllamaClassificationService ollamaClassificationService,
             EmailRepository emailRepository) {
 
-        this.geminiClassificationService = geminiClassificationService;
+        this.ollamaClassificationService = ollamaClassificationService;
         this.emailRepository = emailRepository;
     }
 
@@ -778,14 +778,14 @@ public class EmailClassifierService {
         // ACTION
         // ============================================================
 
-        boolean needsGeminiReview =
+        boolean needsAiReview =
                 confidence < 0.90 ||
                         conflicting ||
                         "OTHER".equals(category);
 
         String action;
 
-        if (needsGeminiReview) {
+        if (needsAiReview) {
 
             action = "PENDING_REVIEW";
 
@@ -822,7 +822,7 @@ public class EmailClassifierService {
          *
          * Therefore it is already considered reviewed.
          */
-        if (!needsGeminiReview) {
+        if (!needsAiReview) {
 
             email.setAiReviewed(true);
 
@@ -853,7 +853,7 @@ public class EmailClassifierService {
     // ASYNC AI REVIEW
     // ================================================================
 
-    public void classifyWithGeminiAsync(
+    public void classifyWithAiAsync(
             Email email,
             boolean hasListUnsubscribe,
             boolean hasListUnsubscribePost,
@@ -912,7 +912,7 @@ public class EmailClassifierService {
         }
 
         System.out.println(
-                "SmartMail: Starting async Gemini review for " +
+                "SmartMail: Starting async Ollama review for " +
                         messageId
         );
 
@@ -920,7 +920,7 @@ public class EmailClassifierService {
 
         try {
 
-            future = geminiClassificationService.classifyAsync(
+            future = ollamaClassificationService.classifyAsync(
                     email.getSender(),
                     normalize(domain),
                     email.getSubject(),
@@ -950,8 +950,8 @@ public class EmailClassifierService {
 
             try {
 
-                GeminiResult parsedResult =
-                        parseGeminiResult(aiResult);
+                AiResult parsedResult =
+                        parseAiResult(aiResult);
 
                 if (parsedResult == null ||
                         !isValidCategory(parsedResult.category) ||
@@ -959,7 +959,7 @@ public class EmailClassifierService {
                         parsedResult.confidence > 1.0) {
 
                     System.out.println(
-                            "SmartMail Gemini async review returned " +
+                            "SmartMail Ollama async review returned " +
                                     "invalid JSON. Keeping PENDING_REVIEW " +
                                     "for " +
                                     messageId
@@ -1009,7 +1009,7 @@ public class EmailClassifierService {
                                 finalAction = "TRASH";
 
                             }
-                            else if (parsedResult.confidence >= 0.90 &&
+                            else if (parsedResult.confidence >= 0.80 &&
                                     "IMPORTANT".equals(
                                             parsedResult.category)) {
 
@@ -1037,7 +1037,7 @@ public class EmailClassifierService {
                                     emailRepository.save(savedEmail);
 
                             System.out.println(
-                                    "SmartMail Gemini async review " +
+                                    "SmartMail Ollama async review " +
                                             "completed: " +
                                             "messageId=" +
                                             saved.getGmailMessageId() +
@@ -1093,7 +1093,7 @@ public class EmailClassifierService {
             catch (Exception e) {
 
                 System.err.println(
-                        "SmartMail Gemini async review failed for " +
+                        "SmartMail Ollama async review failed for " +
                                 messageId +
                                 ": " +
                                 e.getMessage()
@@ -1127,7 +1127,7 @@ public class EmailClassifierService {
             aiReviewsInProgress.remove(messageId);
 
             System.err.println(
-                    "SmartMail: Gemini/Ollama async request failed for " +
+                    "SmartMail: Ollama async request failed for " +
                             messageId +
                             ": " +
                             error.getMessage()
@@ -1230,7 +1230,7 @@ public class EmailClassifierService {
     // PARSE AI RESULT
     // ================================================================
 
-    private GeminiResult parseGeminiResult(String json) {
+    private AiResult parseAiResult(String json) {
 
         if (json == null || json.isBlank()) {
             return null;
@@ -1315,7 +1315,7 @@ public class EmailClassifierService {
                     .replace("\\\\", "\\");
         }
 
-        return new GeminiResult(
+        return new AiResult(
                 category,
                 confidence,
                 reason
@@ -1333,13 +1333,13 @@ public class EmailClassifierService {
                 "SPAM".equals(category);
     }
 
-    private static class GeminiResult {
+    private static class AiResult {
 
         private final String category;
         private final double confidence;
         private final String reason;
 
-        private GeminiResult(
+        private AiResult(
                 String category,
                 double confidence,
                 String reason) {

@@ -76,7 +76,7 @@ public class GmailService {
                             .messages()
                             .list("me")
                             .setLabelIds(List.of("INBOX"))
-                            .setMaxResults(10L)
+                            .setMaxResults(50L)
                             .execute();
 
             List<Message> messages = response.getMessages();
@@ -299,20 +299,12 @@ public class GmailService {
                                                 ".action-value"
                                             );
 
-                                        // =====================================
-                                        // UPDATE CATEGORY
-                                        // =====================================
-
                                         if (categoryElement) {
 
                                             categoryElement.textContent =
                                                 email.category ||
                                                 "PENDING_REVIEW";
                                         }
-
-                                        // =====================================
-                                        // UPDATE CONFIDENCE
-                                        // =====================================
 
                                         if (confidenceElement) {
 
@@ -326,10 +318,6 @@ public class GmailService {
                                                     : confidence;
                                         }
 
-                                        // =====================================
-                                        // UPDATE ACTION
-                                        // =====================================
-
                                         if (actionElement) {
 
                                             actionElement.textContent =
@@ -337,20 +325,12 @@ public class GmailService {
                                                 "PENDING_REVIEW";
                                         }
 
-                                        // =====================================
-                                        // CHECK AI REVIEW STATUS
-                                        // =====================================
-
                                         if (email.aiReviewed !== true) {
 
                                             pendingCount++;
                                         }
 
                                     });
-
-                                    // =================================================
-                                    // UPDATE PAGE STATUS
-                                    // =================================================
 
                                     const status =
                                         document.getElementById(
@@ -372,10 +352,6 @@ public class GmailService {
                                             status.textContent =
                                                 "SmartMail AI review complete.";
                                         }
-
-                                        // =====================================
-                                        // STOP POLLING
-                                        // =====================================
 
                                         if (window.smartMailPolling) {
 
@@ -443,10 +419,6 @@ public class GmailService {
 
             for (Message message : messages) {
 
-                // ========================================================
-                // GET FULL EMAIL
-                // ========================================================
-
                 Message fullMessage =
                         gmail.users()
                                 .messages()
@@ -456,10 +428,6 @@ public class GmailService {
 
                 String sender = "";
                 String subject = "";
-
-                // ========================================================
-                // GET EMAIL HEADERS
-                // ========================================================
 
                 if (fullMessage.getPayload() != null &&
                         fullMessage.getPayload().getHeaders() != null) {
@@ -479,10 +447,6 @@ public class GmailService {
                     }
                 }
 
-                // ========================================================
-                // EXTRACT STRUCTURED EMAIL SIGNALS
-                // ========================================================
-
                 EmailSignals signals =
                         extractEmailSignals(fullMessage);
 
@@ -490,23 +454,11 @@ public class GmailService {
                         "SmartMail signals: " + signals
                 );
 
-                // ========================================================
-                // EXTRACT EMAIL BODY
-                // ========================================================
-
                 String body =
                         extractBody(fullMessage.getPayload());
 
-                // ========================================================
-                // FIND MIME TYPE
-                // ========================================================
-
                 String mimeType =
                         findBodyMimeType(fullMessage.getPayload());
-
-                // ========================================================
-                // CHECK IF EMAIL ALREADY EXISTS
-                // ========================================================
 
                 var existingEmail =
                         emailRepository.findByGmailMessageId(
@@ -518,19 +470,11 @@ public class GmailService {
 
                 if (existingEmail.isPresent()) {
 
-                    // ====================================================
-                    // EXISTING EMAIL
-                    // ====================================================
-
                     email = existingEmail.get();
 
                     email.setSender(sender);
                     email.setSubject(subject);
                     email.setBody(body);
-
-                    // ====================================================
-                    // ALREADY REVIEWED
-                    // ====================================================
 
                     if (email.isAiReviewed()) {
 
@@ -551,10 +495,6 @@ public class GmailService {
 
                 } else {
 
-                    // ====================================================
-                    // NEW EMAIL
-                    // ====================================================
-
                     email = new Email();
 
                     email.setGmailMessageId(fullMessage.getId());
@@ -567,10 +507,6 @@ public class GmailService {
                                     + fullMessage.getId()
                     );
                 }
-
-                // ========================================================
-                // RUN RULE CLASSIFICATION ONLY WHEN NECESSARY
-                // ========================================================
 
                 if (shouldRunClassification) {
 
@@ -589,16 +525,8 @@ public class GmailService {
 
                 } else {
 
-                    // ====================================================
-                    // EXISTING REVIEWED EMAIL
-                    // ====================================================
-
                     emailRepository.save(email);
                 }
-
-                // ========================================================
-                // START ASYNC AI REVIEW ONLY IF NECESSARY
-                // ========================================================
 
                 if (!email.isAiReviewed() &&
                         "PENDING_REVIEW".equalsIgnoreCase(
@@ -609,7 +537,7 @@ public class GmailService {
                                     + email.getGmailMessageId()
                     );
 
-                    classifierService.classifyWithGeminiAsync(
+                    classifierService.classifyWithAiAsync(
                             email,
                             signals.hasListUnsubscribe,
                             signals.hasListUnsubscribePost,
@@ -623,20 +551,6 @@ public class GmailService {
                     );
                 }
 
-                // ========================================================
-                // IMMEDIATE GMAIL ACTION
-                // ========================================================
-                //
-                // Rule-based high-confidence:
-                //
-                // SPAM         -> TRASH
-                // PROMOTIONAL  -> TRASH
-                // IMPORTANT    -> KEEP
-                //
-                // Low confidence is handled asynchronously by AI.
-                //
-                // ========================================================
-
                 if ("TRASH".equalsIgnoreCase(email.getAction())) {
 
                     trashMessage(
@@ -644,10 +558,6 @@ public class GmailService {
                             fullMessage
                     );
                 }
-
-                // ========================================================
-                // EMAIL CARD START
-                // ========================================================
 
                 result.append("""
                         <div
@@ -679,10 +589,6 @@ public class GmailService {
 
                             </div>
                         """);
-
-                // ========================================================
-                // DISPLAY CLASSIFICATION
-                // ========================================================
 
                 result.append("""
                         <div class="classification">
@@ -718,17 +624,9 @@ public class GmailService {
                         </div>
                         """);
 
-                // ========================================================
-                // EMAIL BODY START
-                // ========================================================
-
                 result.append("""
                             <div class="email-body">
                         """);
-
-                // ========================================================
-                // DISPLAY HTML EMAIL
-                // ========================================================
 
                 if ("text/html".equalsIgnoreCase(mimeType)) {
 
@@ -741,18 +639,10 @@ public class GmailService {
 
                 } else {
 
-                    // ====================================================
-                    // DISPLAY PLAIN TEXT EMAIL
-                    // ====================================================
-
                     result.append("<div class=\"plain-body\">")
                             .append(escapeHtml(body))
                             .append("</div>");
                 }
-
-                // ========================================================
-                // EMAIL CARD END
-                // ========================================================
 
                 result.append("""
                             </div>
@@ -760,10 +650,6 @@ public class GmailService {
                         </div>
                         """);
             }
-
-            // ============================================================
-            // HTML PAGE END
-            // ============================================================
 
             result.append("""
                     </body>
@@ -789,6 +675,175 @@ public class GmailService {
                     </body>
                     </html>
                     """;
+        }
+    }
+
+
+    // ============================================================
+    // HUMAN REVIEW - KEEP EMAIL
+    // ============================================================
+
+    public Email keepEmail(
+            OAuth2AuthorizedClient authorizedClient,
+            Long emailId) {
+
+        try {
+
+            Email email =
+                    emailRepository.findById(emailId)
+                            .orElseThrow(
+                                    () -> new IllegalArgumentException(
+                                            "Email not found: " + emailId
+                                    )
+                            );
+
+            String accessToken =
+                    authorizedClient.getAccessToken().getTokenValue();
+
+            GoogleCredentials credentials =
+                    GoogleCredentials.create(
+                            new AccessToken(accessToken, null));
+
+            Gmail gmail = new Gmail.Builder(
+                    GoogleNetHttpTransport.newTrustedTransport(),
+                    GsonFactory.getDefaultInstance(),
+                    new HttpCredentialsAdapter(credentials))
+                    .setApplicationName("SmartMail")
+                    .build();
+
+            String messageId =
+                    email.getGmailMessageId();
+
+            Message currentMessage =
+                    gmail.users()
+                            .messages()
+                            .get("me", messageId)
+                            .setFormat("minimal")
+                            .execute();
+
+            List<String> labelIds =
+                    currentMessage.getLabelIds();
+
+            // ========================================================
+            // IF MESSAGE IS IN TRASH, RESTORE IT TO INBOX
+            // ========================================================
+
+            if (labelIds != null &&
+                    labelIds.contains("TRASH")) {
+
+                ModifyMessageRequest restoreRequest =
+                        new ModifyMessageRequest()
+                                .setAddLabelIds(
+                                        List.of("INBOX")
+                                )
+                                .setRemoveLabelIds(
+                                        List.of("TRASH")
+                                );
+
+                gmail.users()
+                        .messages()
+                        .modify(
+                                "me",
+                                messageId,
+                                restoreRequest
+                        )
+                        .execute();
+
+                System.out.println(
+                        "SmartMail: Restored Gmail message to Inbox: "
+                                + messageId
+                );
+            }
+
+            email.setAction("KEEP");
+            email.setProcessed(true);
+            email.setAiReviewed(true);
+
+            return emailRepository.save(email);
+
+        } catch (Exception e) {
+
+            System.err.println(
+                    "SmartMail: Failed to keep email: "
+                            + emailId
+            );
+
+            e.printStackTrace();
+
+            throw new RuntimeException(
+                    "Could not keep email.",
+                    e
+            );
+        }
+    }
+
+
+    // ============================================================
+    // HUMAN REVIEW - MOVE EMAIL TO TRASH
+    // ============================================================
+
+    public Email trashEmail(
+            OAuth2AuthorizedClient authorizedClient,
+            Long emailId) {
+
+        try {
+
+            Email email =
+                    emailRepository.findById(emailId)
+                            .orElseThrow(
+                                    () -> new IllegalArgumentException(
+                                            "Email not found: " + emailId
+                                    )
+                            );
+
+            String accessToken =
+                    authorizedClient.getAccessToken().getTokenValue();
+
+            GoogleCredentials credentials =
+                    GoogleCredentials.create(
+                            new AccessToken(accessToken, null));
+
+            Gmail gmail = new Gmail.Builder(
+                    GoogleNetHttpTransport.newTrustedTransport(),
+                    GsonFactory.getDefaultInstance(),
+                    new HttpCredentialsAdapter(credentials))
+                    .setApplicationName("SmartMail")
+                    .build();
+
+            Message currentMessage =
+                    gmail.users()
+                            .messages()
+                            .get(
+                                    "me",
+                                    email.getGmailMessageId()
+                            )
+                            .setFormat("minimal")
+                            .execute();
+
+            trashMessage(
+                    gmail,
+                    currentMessage
+            );
+
+            email.setAction("TRASH");
+            email.setProcessed(true);
+            email.setAiReviewed(true);
+
+            return emailRepository.save(email);
+
+        } catch (Exception e) {
+
+            System.err.println(
+                    "SmartMail: Failed to trash email: "
+                            + emailId
+            );
+
+            e.printStackTrace();
+
+            throw new RuntimeException(
+                    "Could not move email to Trash.",
+                    e
+            );
         }
     }
 
@@ -835,18 +890,10 @@ public class GmailService {
             }
         }
 
-        // ============================================================
-        // PARSE SENDER
-        // ============================================================
-
         parseSender(
                 fromValue,
                 signals
         );
-
-        // ============================================================
-        // AUTOMATED SENDER SIGNAL
-        // ============================================================
 
         String normalizedSender =
                 normalizeSignalText(fromValue);
@@ -862,10 +909,6 @@ public class GmailService {
                         containsSignal(normalizedSender, "alerts") ||
                         containsSignal(normalizedSender, "statement") ||
                         containsSignal(normalizedSender, "statements");
-
-        // ============================================================
-        // BULK / MARKETING SIGNAL
-        // ============================================================
 
         signals.bulkMail =
                 signals.hasListUnsubscribe ||
@@ -1162,17 +1205,6 @@ public class GmailService {
     // ============================================================
     // TRASH GMAIL MESSAGE
     // ============================================================
-    //
-    // This replaces the previous ARCHIVE operation.
-    //
-    // SPAM / PROMOTIONAL -> Gmail Trash
-    //
-    // Before trashing, we fetch the current Gmail message and check
-    // whether it already has the TRASH label.
-    //
-    // This prevents repeated Gmail actions when the page is refreshed.
-    //
-    // ============================================================
 
     private void trashMessage(
             Gmail gmail,
@@ -1195,10 +1227,6 @@ public class GmailService {
             String messageId =
                     message.getId();
 
-            // ========================================================
-            // GET CURRENT GMAIL LABELS
-            // ========================================================
-
             Message currentMessage =
                     gmail.users()
                             .messages()
@@ -1212,10 +1240,6 @@ public class GmailService {
             List<String> labelIds =
                     currentMessage.getLabelIds();
 
-            // ========================================================
-            // ALREADY IN TRASH
-            // ========================================================
-
             if (labelIds != null &&
                     labelIds.contains("TRASH")) {
 
@@ -1228,10 +1252,6 @@ public class GmailService {
 
                 return;
             }
-
-            // ========================================================
-            // MOVE TO TRASH
-            // ========================================================
 
             ModifyMessageRequest modifyRequest =
                     new ModifyMessageRequest()
