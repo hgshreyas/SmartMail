@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8080";
+
 function App() {
   const [emails, setEmails] = useState([]);
   const [filter, setFilter] = useState("ALL");
@@ -9,11 +11,18 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionLoading, setActionLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [reviewProgress, setReviewProgress] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
 
   const fetchEmails = async () => {
     try {
       const response = await fetch(
-          "http://localhost:8080/emails/gmail/results"
+          `${API_BASE}/emails/gmail/results`,
+          {
+            credentials: "include",
+          }
       );
 
       if (!response.ok) {
@@ -22,10 +31,14 @@ function App() {
 
       const data = await response.json();
 
-      setEmails(data);
+      setEmails(Array.isArray(data) ? data : []);
+      setConnected(true);
+      setLastUpdated(new Date());
       setError("");
     } catch (err) {
       console.error(err);
+
+      setConnected(false);
 
       setError(
           "Backend is not reachable. Make sure the SmartMail Spring Boot server is running."
@@ -35,10 +48,48 @@ function App() {
     }
   };
 
+  const fetchReviewProgress = async () => {
+    try {
+      const response = await fetch(
+          `${API_BASE}/emails/pending-review/progress`,
+          {
+            credentials: "include",
+          }
+      );
+
+      if (!response.ok) {
+        return;
+      }
+
+      const data = await response.json();
+
+      setReviewProgress(data);
+    } catch (err) {
+      console.debug("Pending-review progress is unavailable.", err);
+    }
+  };
+
+  const handleRefresh = async () => {
+    try {
+      setRefreshing(true);
+
+      await Promise.all([
+        fetchEmails(),
+        fetchReviewProgress(),
+      ]);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   useEffect(() => {
     fetchEmails();
+    fetchReviewProgress();
 
-    const interval = setInterval(fetchEmails, 3000);
+    const interval = setInterval(() => {
+      fetchEmails();
+      fetchReviewProgress();
+    }, 3000);
 
     return () => clearInterval(interval);
   }, []);
@@ -58,7 +109,7 @@ function App() {
       setError("");
 
       const response = await fetch(
-          `http://localhost:8080/emails/${selectedEmail.id}/keep`,
+          `${API_BASE}/emails/${selectedEmail.id}/keep`,
           {
             method: "POST",
             credentials: "include",
@@ -108,7 +159,7 @@ function App() {
       setError("");
 
       const response = await fetch(
-          `http://localhost:8080/emails/${selectedEmail.id}/trash`,
+          `${API_BASE}/emails/${selectedEmail.id}/trash`,
           {
             method: "POST",
             credentials: "include",
@@ -143,38 +194,55 @@ function App() {
     }
   };
 
+  const visibleEmails = useMemo(() => {
+    return emails.filter((email) => {
+      const gmailMessageId = String(email.gmailMessageId || "");
+
+      return !gmailMessageId.startsWith("retry-test-");
+    });
+  }, [emails]);
+
   const counts = useMemo(() => {
     return {
-      all: emails.length,
+      all: visibleEmails.length,
 
-      important: emails.filter(
+      important: visibleEmails.filter(
           (email) => email.category === "IMPORTANT"
       ).length,
 
-      promotional: emails.filter(
+      promotional: visibleEmails.filter(
           (email) => email.category === "PROMOTIONAL"
       ).length,
 
-      spam: emails.filter(
+      spam: visibleEmails.filter(
           (email) => email.category === "SPAM"
       ).length,
 
-      review: emails.filter(
-          (email) => email.action === "PENDING_REVIEW"
+      review: visibleEmails.filter(
+          (email) =>
+              email.action === "PENDING_REVIEW" &&
+              email.aiReviewed === true
+      ).length,
+
+      aiQueue: visibleEmails.filter(
+          (email) =>
+              email.action === "PENDING_REVIEW" &&
+              email.aiReviewed === false
       ).length,
     };
-  }, [emails]);
+  }, [visibleEmails]);
 
   const filteredEmails = useMemo(() => {
-    return emails.filter((email) => {
+    return visibleEmails.filter((email) => {
       const matchesFilter =
           filter === "ALL"
               ? true
               : filter === "REVIEW"
-                  ? email.action === "PENDING_REVIEW"
+                  ? email.action === "PENDING_REVIEW" &&
+                  email.aiReviewed === true
                   : email.category === filter;
 
-      const searchText = search.toLowerCase();
+      const searchText = search.toLowerCase().trim();
 
       const matchesSearch =
           !searchText ||
@@ -184,7 +252,19 @@ function App() {
 
       return matchesFilter && matchesSearch;
     });
-  }, [emails, filter, search]);
+  }, [visibleEmails, filter, search]);
+
+  const formatStage = (stage) => {
+    if (!stage) {
+      return "Idle";
+    }
+
+    return stage
+        .toLowerCase()
+        .split("_")
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ");
+  };
 
   const getCategoryClass = (category) => {
     switch (category) {
@@ -294,11 +374,15 @@ function App() {
 
           </div>
 
-          <div className="connection">
+          <div
+              className={`connection ${
+                  connected ? "" : "connection-offline"
+              }`}
+          >
 
             <span className="connection-dot"></span>
 
-            Gmail Connected
+            {connected ? "SmartMail Online" : "Backend Offline"}
 
           </div>
 
@@ -328,10 +412,81 @@ function App() {
 
             <button
                 className="refresh-button"
-                onClick={fetchEmails}
+                onClick={handleRefresh}
+                disabled={refreshing}
             >
-              ↻ Refresh
+              {refreshing ? "Refreshing..." : "↻ Refresh"}
             </button>
+
+          </section>
+
+
+          <section className="system-status">
+
+            <div
+                className={`status-item ${
+                    connected ? "status-ok" : "status-error"
+                }`}
+            >
+              <span className="status-dot"></span>
+
+              <div>
+                <small>Backend</small>
+                <strong>
+                  {connected ? "Online" : "Offline"}
+                </strong>
+              </div>
+            </div>
+
+            <div className="status-item">
+              <div>
+                <small>AI Queue</small>
+                <strong>{counts.aiQueue}</strong>
+              </div>
+            </div>
+
+            <div className="status-item">
+              <div>
+                <small>Human Review</small>
+                <strong>{counts.review}</strong>
+              </div>
+            </div>
+
+            <div
+                className={`status-item ${
+                    reviewProgress?.processing
+                        ? "status-working"
+                        : ""
+                }`}
+            >
+              <div>
+                <small>Review Processor</small>
+
+                <strong>
+                  {reviewProgress?.processing
+                      ? formatStage(reviewProgress.stage)
+                      : "Idle"}
+                </strong>
+              </div>
+            </div>
+
+            <div className="status-item status-updated">
+              <div>
+
+                <small>Last Updated</small>
+
+                <strong>
+                  {lastUpdated
+                      ? lastUpdated.toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        second: "2-digit",
+                      })
+                      : "-"}
+                </strong>
+
+              </div>
+            </div>
 
           </section>
 
@@ -368,9 +523,9 @@ function App() {
 
               <div>
 
-                <span>
-                  Total Emails
-                </span>
+              <span>
+                Total Emails
+              </span>
 
                 <strong>
                   {counts.all}
@@ -396,9 +551,9 @@ function App() {
 
               <div>
 
-                <span>
-                  Important
-                </span>
+              <span>
+                Important
+              </span>
 
                 <strong>
                   {counts.important}
@@ -424,9 +579,9 @@ function App() {
 
               <div>
 
-                <span>
-                  Promotional
-                </span>
+              <span>
+                Promotional
+              </span>
 
                 <strong>
                   {counts.promotional}
@@ -452,9 +607,9 @@ function App() {
 
               <div>
 
-                <span>
-                  Spam
-                </span>
+              <span>
+                Spam
+              </span>
 
                 <strong>
                   {counts.spam}
@@ -480,9 +635,9 @@ function App() {
 
               <div>
 
-                <span>
-                  Review
-                </span>
+              <span>
+                Human Review
+              </span>
 
                 <strong>
                   {counts.review}
@@ -510,7 +665,7 @@ function App() {
                 </h2>
 
                 <p>
-                  Showing {filteredEmails.length} of {emails.length} emails
+                  Showing {filteredEmails.length} of {visibleEmails.length} emails
                 </p>
 
               </div>
@@ -518,9 +673,9 @@ function App() {
 
               <div className="search-box">
 
-                <span>
-                  ⌕
-                </span>
+              <span>
+                ⌕
+              </span>
 
                 <input
                     type="text"
@@ -598,7 +753,7 @@ function App() {
                   }
                   onClick={() => setFilter("REVIEW")}
               >
-                Pending Review
+                Human Review
               </button>
 
             </div>
@@ -635,8 +790,8 @@ function App() {
 
                   <p>
 
-                    {emails.length === 0
-                        ? "Run the Gmail test from the backend first."
+                    {visibleEmails.length === 0
+                        ? "No Gmail messages have been loaded yet."
                         : "Try changing the filter or search term."}
 
                   </p>
@@ -682,14 +837,14 @@ function App() {
 
                             <div className="email-badges">
 
-                              <span
-                                  className={getCategoryClass(
-                                      email.category
-                                  )}
-                              >
-                                {email.category ||
-                                    "UNCLASSIFIED"}
-                              </span>
+                        <span
+                            className={getCategoryClass(
+                                email.category
+                            )}
+                        >
+                          {email.category ||
+                              "UNCLASSIFIED"}
+                        </span>
 
 
                               <span
@@ -697,9 +852,9 @@ function App() {
                                       email.action
                                   )}
                               >
-                                {email.action ||
-                                    "PENDING"}
-                              </span>
+                          {email.action ||
+                              "PENDING"}
+                        </span>
 
                             </div>
 
@@ -727,34 +882,46 @@ function App() {
 
                           <div className="email-meta">
 
-                            <span>
+                      <span>
 
-                              AI Confidence:{" "}
+                        AI Confidence:{" "}
 
-                              <strong>
-                                {formatConfidence(
-                                    email.confidence
-                                )}
-                              </strong>
+                        <strong>
+                          {formatConfidence(
+                              email.confidence
+                          )}
+                        </strong>
 
-                            </span>
+                      </span>
 
 
                             {email.aiReviewed && (
 
                                 <span className="ai-reviewed">
-                                  ✓ AI Reviewed
-                                </span>
+                          ✓ AI Reviewed
+                        </span>
 
                             )}
 
 
                             {email.action ===
-                                "PENDING_REVIEW" && (
+                                "PENDING_REVIEW" &&
+                                email.aiReviewed && (
 
                                     <span className="review-needed">
-                                      Needs Review
-                                    </span>
+                            Human Review
+                          </span>
+
+                                )}
+
+
+                            {email.action ===
+                                "PENDING_REVIEW" &&
+                                !email.aiReviewed && (
+
+                                    <span className="ai-queued">
+                            AI Queue
+                          </span>
 
                                 )}
 
@@ -784,7 +951,8 @@ function App() {
             <div
                 className="modal-overlay"
                 onClick={() =>
-                    !actionLoading && setSelectedEmail(null)
+                    !actionLoading &&
+                    setSelectedEmail(null)
                 }
             >
 
@@ -798,7 +966,8 @@ function App() {
                 <button
                     className="close-button"
                     onClick={() =>
-                        !actionLoading && setSelectedEmail(null)
+                        !actionLoading &&
+                        setSelectedEmail(null)
                     }
                     disabled={actionLoading}
                 >
@@ -844,14 +1013,14 @@ function App() {
 
                 <div className="modal-badges">
 
-                  <span
-                      className={getCategoryClass(
-                          selectedEmail.category
-                      )}
-                  >
-                    {selectedEmail.category ||
-                        "UNCLASSIFIED"}
-                  </span>
+              <span
+                  className={getCategoryClass(
+                      selectedEmail.category
+                  )}
+              >
+                {selectedEmail.category ||
+                    "UNCLASSIFIED"}
+              </span>
 
 
                   <span
@@ -859,20 +1028,20 @@ function App() {
                           selectedEmail.action
                       )}
                   >
-                    {selectedEmail.action ||
-                        "PENDING"}
-                  </span>
+                {selectedEmail.action ||
+                    "PENDING"}
+              </span>
 
 
                   <span className="confidence-badge">
 
-                    Confidence:{" "}
+                Confidence:{" "}
 
                     {formatConfidence(
                         selectedEmail.confidence
                     )}
 
-                  </span>
+              </span>
 
                 </div>
 
@@ -918,14 +1087,16 @@ function App() {
                         <div className="review-panel">
 
                           <h3>
-                            Human Review Required
+                            {selectedEmail.aiReviewed
+                                ? "Human Review Required"
+                                : "Review Pending"}
                           </h3>
 
 
                           <p>
-                            SmartMail is not confident enough
-                            to automatically move this email.
-                            You can review it before taking action.
+                            {selectedEmail.aiReviewed
+                                ? "SmartMail reviewed this email but kept it for your decision because confidence was not high enough for an automatic action."
+                                : "This email is still waiting for an AI or manual decision."}
                           </p>
 
 

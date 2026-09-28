@@ -11,3 +11,5 @@ backend/target/
 # OS files
 .DS_Store
 Thumbs.db
+# Generated Spring help file
+backend/HELP.md

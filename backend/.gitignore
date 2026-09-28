@@ -1,36 +1,45 @@
-HELP.md
+# Local configuration / secrets
+backend/src/main/resources/application-local.properties
+
+# Environment variables / secrets
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Maven / Java
 target/
-.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
+**/target/
 
-### STS ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
+# React / Vite / Node
+node_modules/
+**/node_modules/
+dist/
+**/dist/
 
-### IntelliJ IDEA ###
-.idea
-*.iws
+# Build output
+build/
+**/build/
+
+# IDE
+.idea/
 *.iml
+*.iws
 *.ipr
 
-### NetBeans ###
-/nbproject/private/
-/nbbuild/
-/dist/
-/nbdist/
-/.nb-gradle/
-build/
-!**/src/main/**/build/
-!**/src/test/**/build/
-
-### VS Code ###
+# VS Code
 .vscode/
 
-### SmartMail local configuration ###
-backend/src/main/resources/application-local.properties
+# Logs
+*.log
+logs/
+**/logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated Spring help file
+backend/HELP.md

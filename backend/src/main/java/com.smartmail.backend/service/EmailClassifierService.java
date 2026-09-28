@@ -7,6 +7,8 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -30,6 +32,22 @@ public class EmailClassifierService {
      */
     private final Set<String> aiReviewsInProgress =
             ConcurrentHashMap.newKeySet();
+
+    /*
+     * Limits the number of different emails that can be sent to Ollama
+     * at the same time. Emails that cannot get a slot remain
+     * PENDING_REVIEW and can be processed on a later refresh.
+     */
+    private final Semaphore aiReviewSlots = new Semaphore(2);
+
+    /*
+     * Keeps track of automatic AI retry attempts per Gmail message.
+     */
+    private final ConcurrentHashMap<String, Integer> aiRetryAttempts =
+            new ConcurrentHashMap<>();
+
+    private static final int MAX_AI_RETRIES = 2;
+    private static final long AI_RETRY_DELAY_SECONDS = 5;
 
     public EmailClassifierService(
             OllamaClassificationService ollamaClassificationService,
@@ -635,6 +653,166 @@ public class EmailClassifierService {
         }
 
         // ============================================================
+        // HIGH-CONFIDENCE SUBJECT/SENDER RULES
+        // ============================================================
+
+        /*
+         * These rules cover common real-world cases that were left in
+         * manual review by the lightweight model. They intentionally use
+         * specific subject/sender combinations instead of broad keywords.
+         */
+
+        // Account/security permission activity.
+        if (containsTerm(subject, "you shared some google account data with")) {
+            importantScore += 7;
+            importantReasons.add("Google account data sharing activity");
+        }
+
+        // Personal financial/account activity.
+        if (containsTerm(subject, "smart transfer facility") &&
+                containsTerm(subject, "activated")) {
+
+            importantScore += 7;
+            importantReasons.add("financial facility activation");
+        }
+
+        if (containsTerm(subject, "statement of account of securities")) {
+            importantScore += 7;
+            importantReasons.add("securities account statement");
+        }
+
+        if (containsTerm(subject, "order confirmation")) {
+            importantScore += 7;
+            importantReasons.add("order confirmation");
+        }
+
+        if (containsTerm(subject, "neucoin") &&
+                containsTerm(subject, "used")) {
+
+            importantScore += 6;
+            importantReasons.add("loyalty transaction");
+        }
+
+        // Jobs, internships, competitions and event progress.
+        if (containsTerm(subject, "applications closing")) {
+            importantScore += 6;
+            importantReasons.add("application deadline");
+        }
+
+        if (containsTerm(subject, "internship alert")) {
+            importantScore += 6;
+            importantReasons.add("internship alert");
+        }
+
+        if (containsTerm(subject, "is hiring") ||
+                containsTerm(subject, "hiring interns") ||
+                containsTerm(subject, "hiring intern")) {
+
+            importantScore += 6;
+            importantReasons.add("hiring alert");
+        }
+
+        if (containsTerm(subject, "pre placement offer") ||
+                containsTerm(subject, "pre placement interview") ||
+                containsTerm(subject, "ppo") ||
+                containsTerm(subject, "ppi")) {
+
+            importantScore += 6;
+            importantReasons.add("pre-placement opportunity");
+        }
+
+        if (containsTerm(subject, "thank you for completing round")) {
+            importantScore += 7;
+            importantReasons.add("competition round completion");
+        }
+
+        if (containsTerm(subject, "official") &&
+                containsTerm(subject, "whatsapp group")) {
+
+            importantScore += 6;
+            importantReasons.add("event coordination");
+        }
+
+        if (containsTerm(sender, "unstop") &&
+                (containsTerm(subject, "challenge") ||
+                        containsTerm(subject, "hiring") ||
+                        containsTerm(subject, "internship") ||
+                        containsTerm(subject, "round"))) {
+
+            importantScore += 6;
+            importantReasons.add("Unstop opportunity/progress");
+        }
+
+        // Clear marketing/product/newsletter messages.
+        if (containsTerm(sender, "google ai studio") &&
+                containsTerm(subject, "introducing")) {
+
+            promotionalScore += 6;
+            promotionalReasons.add("product announcement");
+        }
+
+        if (containsTerm(sender, "bigbasket") &&
+                (containsTerm(subject, "rakhi") ||
+                        containsTerm(subject, "save these for"))) {
+
+            promotionalScore += 6;
+            promotionalReasons.add("retail marketing");
+        }
+
+        if (containsTerm(sender, "adobe acrobat") &&
+                (containsTerm(subject, "easily share pdfs") ||
+                        containsTerm(subject, "efficiency in your pocket"))) {
+
+            promotionalScore += 6;
+            promotionalReasons.add("Adobe product marketing");
+        }
+
+        if (containsTerm(sender, "motilal oswal mutual fund") &&
+                (containsTerm(subject, "one fund") ||
+                        containsTerm(subject, "investment approach"))) {
+
+            promotionalScore += 6;
+            promotionalReasons.add("fund marketing");
+        }
+
+        if (containsTerm(sender, "coindcx") &&
+                containsTerm(subject, "last chance to win")) {
+
+            promotionalScore += 6;
+            promotionalReasons.add("promotional giveaway");
+        }
+
+        if (containsTerm(sender, "rive community") &&
+                containsTerm(subject, "this week on rive community")) {
+
+            promotionalScore += 6;
+            promotionalReasons.add("community digest");
+        }
+
+        if (containsTerm(sender, "microsoft learn") &&
+                containsTerm(subject, "see what your peers are learning")) {
+
+            promotionalScore += 6;
+            promotionalReasons.add("learning newsletter");
+        }
+
+        if (containsTerm(sender, "ollama") &&
+                containsTerm(subject, "desktop support")) {
+
+            promotionalScore += 6;
+            promotionalReasons.add("product update");
+        }
+
+        if (containsTerm(sender, "leetcode") &&
+                (containsTerm(subject, "back to school special") ||
+                        containsTerm(subject, "limited time") ||
+                        containsTerm(subject, "60 off"))) {
+
+            promotionalScore += 6;
+            promotionalReasons.add("discount promotion");
+        }
+
+        // ============================================================
         // STRUCTURED GMAIL SIGNALS
         // ============================================================
 
@@ -767,11 +945,43 @@ public class EmailClassifierService {
         else if (maxScore >= 6) {
             confidence = 0.93;
         }
+        else if (maxScore >= 5) {
+            confidence = 0.90;
+        }
         else if (maxScore >= 4) {
             confidence = 0.85;
         }
         else {
             confidence = 0.70;
+        }
+
+        // ============================================================
+        // RULE-FIRST FAST PATH
+        // ============================================================
+
+        /*
+         * Skip Ollama for clear bulk/promotional mail when Gmail's
+         * unsubscribe metadata agrees with the rule result and there
+         * is no competing IMPORTANT or SPAM evidence.
+         *
+         * This intentionally does NOT fast-path an automated sender
+         * by itself. Automated transactional/security mail can still
+         * go to Ollama unless stronger rules classify it as IMPORTANT.
+         */
+        boolean safeBulkPromotional =
+                "PROMOTIONAL".equals(category) &&
+                        promotionalScore >= 2 &&
+                        importantScore == 0 &&
+                        spamScore == 0 &&
+                        !conflicting &&
+                        (bulkMail ||
+                                hasListUnsubscribe ||
+                                hasListUnsubscribePost);
+
+        if (safeBulkPromotional &&
+                confidence < 0.90) {
+
+            confidence = 0.90;
         }
 
         // ============================================================
@@ -911,6 +1121,24 @@ public class EmailClassifierService {
             return;
         }
 
+        /*
+         * Do not allow a large mailbox refresh to start hundreds of
+         * Ollama requests at once. Only two AI reviews are allowed
+         * to run at the same time.
+         */
+        if (!aiReviewSlots.tryAcquire()) {
+
+            aiReviewsInProgress.remove(messageId);
+
+            System.out.println(
+                    "SmartMail: Ollama concurrency limit reached. " +
+                            "Leaving email PENDING_REVIEW: " +
+                            messageId
+            );
+
+            return;
+        }
+
         System.out.println(
                 "SmartMail: Starting async Ollama review for " +
                         messageId
@@ -935,6 +1163,7 @@ public class EmailClassifierService {
         catch (Exception e) {
 
             aiReviewsInProgress.remove(messageId);
+            aiReviewSlots.release();
 
             System.err.println(
                     "SmartMail: Failed to start AI review for " +
@@ -963,6 +1192,17 @@ public class EmailClassifierService {
                                     "invalid JSON. Keeping PENDING_REVIEW " +
                                     "for " +
                                     messageId
+                    );
+
+                    scheduleAiRetry(
+                            email,
+                            hasListUnsubscribe,
+                            hasListUnsubscribePost,
+                            bulkMail,
+                            automatedSender,
+                            domain,
+                            actionHandler,
+                            messageId
                     );
 
                     return;
@@ -1077,6 +1317,8 @@ public class EmailClassifierService {
                                     actionException.printStackTrace();
                                 }
                             }
+
+                            aiRetryAttempts.remove(messageId);
                         },
 
                         () -> {
@@ -1101,8 +1343,21 @@ public class EmailClassifierService {
 
                 e.printStackTrace();
 
+                scheduleAiRetry(
+                        email,
+                        hasListUnsubscribe,
+                        hasListUnsubscribePost,
+                        bulkMail,
+                        automatedSender,
+                        domain,
+                        actionHandler,
+                        messageId
+                );
+
             }
             finally {
+
+                aiReviewSlots.release();
 
                 /*
                  * Allow future processing only if the email still
@@ -1125,6 +1380,7 @@ public class EmailClassifierService {
              * is allowed.
              */
             aiReviewsInProgress.remove(messageId);
+            aiReviewSlots.release();
 
             System.err.println(
                     "SmartMail: Ollama async request failed for " +
@@ -1133,8 +1389,81 @@ public class EmailClassifierService {
                             error.getMessage()
             );
 
+            scheduleAiRetry(
+                    email,
+                    hasListUnsubscribe,
+                    hasListUnsubscribePost,
+                    bulkMail,
+                    automatedSender,
+                    domain,
+                    actionHandler,
+                    messageId
+            );
+
             return null;
         });
+    }
+
+    // ================================================================
+    // AI RETRY
+    // ================================================================
+
+    private void scheduleAiRetry(
+            Email email,
+            boolean hasListUnsubscribe,
+            boolean hasListUnsubscribePost,
+            boolean bulkMail,
+            boolean automatedSender,
+            String domain,
+            Consumer<Email> actionHandler,
+            String messageId) {
+
+        int attempt =
+                aiRetryAttempts.merge(
+                        messageId,
+                        1,
+                        Integer::sum
+                );
+
+        if (attempt > MAX_AI_RETRIES) {
+
+            aiRetryAttempts.remove(messageId);
+
+            System.err.println(
+                    "SmartMail: AI retry limit reached for " +
+                            messageId +
+                            ". Leaving email PENDING_REVIEW."
+            );
+
+            return;
+        }
+
+        System.out.println(
+                "SmartMail: Scheduling AI retry " +
+                        attempt +
+                        "/" +
+                        MAX_AI_RETRIES +
+                        " for " +
+                        messageId +
+                        " in " +
+                        AI_RETRY_DELAY_SECONDS +
+                        " seconds."
+        );
+
+        CompletableFuture.delayedExecutor(
+                AI_RETRY_DELAY_SECONDS,
+                TimeUnit.SECONDS
+        ).execute(() ->
+                classifyWithAiAsync(
+                        email,
+                        hasListUnsubscribe,
+                        hasListUnsubscribePost,
+                        bulkMail,
+                        automatedSender,
+                        domain,
+                        actionHandler
+                )
+        );
     }
 
     // ================================================================
@@ -1147,12 +1476,8 @@ public class EmailClassifierService {
             int promotional,
             int other) {
 
-        int highest = Math.max(
-                Math.max(spam, important),
-                Math.max(promotional, other)
-        );
-
-        int second = 0;
+        int highest = -1;
+        int second = -1;
 
         int[] scores = {
                 spam,
@@ -1163,12 +1488,26 @@ public class EmailClassifierService {
 
         for (int score : scores) {
 
-            if (score < highest && score > second) {
+            if (score > highest) {
+
+                second = highest;
+                highest = score;
+
+            }
+            else if (score > second) {
+
+                /*
+                 * Allow second == highest so a tie between two
+                 * categories is correctly treated as a conflict.
+                 */
                 second = score;
             }
         }
 
-        return second;
+        return Math.max(
+                second,
+                0
+        );
     }
 
     // ================================================================
@@ -1215,11 +1554,16 @@ public class EmailClassifierService {
         String normalizedBody =
                 body == null ? "" : body.trim();
 
-        if (normalizedBody.length() > 4000) {
+        /*
+         * Ollama is now reserved for genuinely uncertain emails.
+         * Keep the body context small to reduce inference time and
+         * sustained GPU load on the local machine.
+         */
+        if (normalizedBody.length() > 1000) {
 
             return normalizedBody.substring(
                     0,
-                    4000
+                    1000
             );
         }
 
@@ -1253,21 +1597,31 @@ public class EmailClassifierService {
             cleaned = cleaned.trim();
         }
 
+        /*
+         * llama3.2:1b sometimes returns valid-looking JSON with the
+         * confidence value quoted, for example:
+         *
+         * "confidence": "0.95"
+         *
+         * It can also occasionally return 95 or "95%".
+         * Accept those harmless formatting variants instead of
+         * rejecting the whole AI result.
+         */
         Pattern categoryPattern =
                 Pattern.compile(
-                        "\"category\"\\s*:\\s*\"([^\"]+)\"",
+                        "[\"']category[\"']\\s*:\\s*[\"']([^\"']+)[\"']",
                         Pattern.CASE_INSENSITIVE
                 );
 
         Pattern confidencePattern =
                 Pattern.compile(
-                        "\"confidence\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)",
+                        "[\"']confidence[\"']\\s*:\\s*[\"']?([0-9]+(?:\\.[0-9]+)?)(?:\\s*%)?[\"']?",
                         Pattern.CASE_INSENSITIVE
                 );
 
         Pattern reasonPattern =
                 Pattern.compile(
-                        "\"reason\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"",
+                        "[\"']reason[\"']\\s*:\\s*[\"']((?:\\\\.|[^\"'\\\\])*)[\"']",
                         Pattern.CASE_INSENSITIVE
                 );
 
@@ -1282,6 +1636,11 @@ public class EmailClassifierService {
 
         if (!categoryMatcher.find() ||
                 !confidenceMatcher.find()) {
+
+            System.out.println(
+                    "SmartMail: Could not parse AI JSON: "
+                            + cleaned
+            );
 
             return null;
         }
@@ -1298,6 +1657,17 @@ public class EmailClassifierService {
             confidence = Double.parseDouble(
                     confidenceMatcher.group(1)
             );
+
+            /*
+             * Small local models sometimes use percentage-style
+             * confidence such as 95 instead of 0.95.
+             */
+            if (confidence > 1.0 &&
+                    confidence <= 100.0) {
+
+                confidence =
+                        confidence / 100.0;
+            }
 
         }
         catch (NumberFormatException e) {
@@ -1321,6 +1691,7 @@ public class EmailClassifierService {
                 reason
         );
     }
+
 
     // ================================================================
     // VALID CATEGORY

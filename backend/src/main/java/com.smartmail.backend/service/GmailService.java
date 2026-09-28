@@ -1,9 +1,14 @@
 package com.smartmail.backend.service;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -15,6 +20,7 @@ import com.smartmail.backend.model.Email;
 import com.smartmail.backend.repository.EmailRepository;
 
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
+import com.google.api.client.googleapis.json.GoogleJsonResponseException;
 import com.google.api.client.json.gson.GsonFactory;
 import com.google.api.services.gmail.Gmail;
 import com.google.api.services.gmail.model.ListMessagesResponse;
@@ -24,9 +30,32 @@ import com.google.api.services.gmail.model.ModifyMessageRequest;
 import com.google.auth.http.HttpCredentialsAdapter;
 import com.google.auth.oauth2.AccessToken;
 import com.google.auth.oauth2.GoogleCredentials;
+import com.google.auth.oauth2.UserCredentials;
 
 @Service
 public class GmailService {
+
+    // Process the full Gmail inbox in controlled chunks.
+    // Only 50 full Gmail messages are handled at a time so a mailbox with
+    // thousands of messages is processed sequentially without flooding
+    // Gmail or starting parallel local-AI work.
+    private static final int PROCESSING_BATCH_SIZE = 50;
+
+    // Keep Gmail API usage comfortably below the per-user quota.
+    // The normal Gmail pass is rules-first and NEVER invokes Ollama directly.
+    private static final long MESSAGE_COOLDOWN_MS = 250L;
+    private static final long BATCH_COOLDOWN_MS = 1_000L;
+
+    // Gmail quota windows are minute-based. If Gmail reports a rate limit,
+    // wait slightly longer than one minute and retry the SAME operation.
+    private static final long RATE_LIMIT_BACKOFF_MS = 65_000L;
+    private static final int MAX_RATE_LIMIT_RETRIES = 3;
+
+    private final AtomicInteger progressTotal = new AtomicInteger(0);
+    private final AtomicInteger progressProcessed = new AtomicInteger(0);
+    private final AtomicInteger progressFailed = new AtomicInteger(0);
+    private volatile boolean processing = false;
+    private volatile String progressStage = "IDLE";
 
     private final EmailRepository emailRepository;
     private final EmailClassifierService classifierService;
@@ -43,48 +72,117 @@ public class GmailService {
             @RegisteredOAuth2AuthorizedClient("google")
             OAuth2AuthorizedClient authorizedClient) {
 
+        synchronized (this) {
+
+            if (processing) {
+
+                System.out.println(
+                        "SmartMail: Gmail bulk processing is already running."
+                );
+
+                return "<h2>SmartMail Gmail processing is already running.</h2>";
+            }
+
+            processing = true;
+        }
+
         try {
+
+            progressTotal.set(0);
+            progressProcessed.set(0);
+            progressFailed.set(0);
+            progressStage = "FETCHING_GMAIL";
 
             // ============================================================
             // GET GOOGLE ACCESS TOKEN
             // ============================================================
 
-            String accessToken =
-                    authorizedClient.getAccessToken().getTokenValue();
-
             GoogleCredentials credentials =
-                    GoogleCredentials.create(
-                            new AccessToken(accessToken, null));
+                    createGoogleCredentials(
+                            authorizedClient
+                    );
 
             // ============================================================
             // CREATE GMAIL CLIENT
             // ============================================================
 
-            Gmail gmail = new Gmail.Builder(
-                    GoogleNetHttpTransport.newTrustedTransport(),
-                    GsonFactory.getDefaultInstance(),
-                    new HttpCredentialsAdapter(credentials))
-                    .setApplicationName("SmartMail")
-                    .build();
+            Gmail gmail =
+                    createGmailClient(
+                            credentials
+                    );
 
             // ============================================================
             // GET GMAIL INBOX MESSAGES
             // ============================================================
 
-            ListMessagesResponse response =
-                    gmail.users()
-                            .messages()
-                            .list("me")
-                            .setLabelIds(List.of("INBOX"))
-                            .setMaxResults(50L)
-                            .execute();
+            // Gmail returns messages in pages. Each page can contain
+            // at most 50 messages here. Keep requesting pages until Gmail
+            // does not provide another page token.
+            List<Message> messages = new ArrayList<>();
+            String nextPageToken = null;
 
-            List<Message> messages = response.getMessages();
+            do {
+
+                ListMessagesResponse response =
+                        listInboxPageWithRetry(
+                                gmail,
+                                nextPageToken
+                        );
+
+                if (response.getMessages() != null) {
+                    messages.addAll(response.getMessages());
+                }
+
+                nextPageToken = response.getNextPageToken();
+
+                System.out.println(
+                        "SmartMail: Gmail pagination fetched "
+                                + messages.size()
+                                + " message(s) so far."
+                );
+
+            } while (nextPageToken != null && !nextPageToken.isBlank());
 
             if (messages == null || messages.isEmpty()) {
 
+                progressTotal.set(0);
+                progressProcessed.set(0);
+                processing = false;
+                progressStage = "NO_MESSAGES";
+
                 return "<h2>No Gmail messages found.</h2>";
             }
+
+            /*
+             * Process the ENTIRE inbox snapshot, but do it in safe chunks of
+             * PROCESSING_BATCH_SIZE. This lets SmartMail sort mailboxes with
+             * thousands of messages while keeping Gmail requests sequential.
+             *
+             * IMPORTANT:
+             * This normal Gmail pass does NOT run Ollama. Any unresolved email
+             * is saved as PENDING_REVIEW and can later be handled by the
+             * controlled PendingReviewService.
+             */
+            int totalMessagesFound = messages.size();
+
+            progressTotal.set(totalMessagesFound);
+            progressProcessed.set(0);
+            progressFailed.set(0);
+            progressStage = "PROCESSING_EMAILS";
+
+            int totalBatches =
+                    (totalMessagesFound + PROCESSING_BATCH_SIZE - 1)
+                            / PROCESSING_BATCH_SIZE;
+
+            System.out.println(
+                    "SmartMail: Bulk processing "
+                            + totalMessagesFound
+                            + " Gmail message(s) in "
+                            + totalBatches
+                            + " sequential batch(es) of up to "
+                            + PROCESSING_BATCH_SIZE
+                            + "."
+            );
 
             StringBuilder result = new StringBuilder();
 
@@ -402,7 +500,7 @@ public class GmailService {
 
                     <div class="page-title">
                         Gmail Messages Found: """)
-                    .append(messages.size())
+                    .append(totalMessagesFound)
                     .append("""
                     </div>
 
@@ -417,238 +515,385 @@ public class GmailService {
             // PROCESS EACH EMAIL
             // ============================================================
 
-            for (Message message : messages) {
+            for (int batchStart = 0;
+                 batchStart < messages.size();
+                 batchStart += PROCESSING_BATCH_SIZE) {
 
-                Message fullMessage =
-                        gmail.users()
-                                .messages()
-                                .get("me", message.getId())
-                                .setFormat("full")
-                                .execute();
+                int batchEnd =
+                        Math.min(
+                                batchStart + PROCESSING_BATCH_SIZE,
+                                messages.size()
+                        );
 
-                String sender = "";
-                String subject = "";
+                int batchNumber =
+                        (batchStart / PROCESSING_BATCH_SIZE) + 1;
 
-                if (fullMessage.getPayload() != null &&
-                        fullMessage.getPayload().getHeaders() != null) {
+                List<Message> currentBatch =
+                        messages.subList(
+                                batchStart,
+                                batchEnd
+                        );
 
-                    for (var header :
-                            fullMessage.getPayload().getHeaders()) {
-
-                        if ("From".equalsIgnoreCase(header.getName())) {
-
-                            sender = header.getValue();
-                        }
-
-                        if ("Subject".equalsIgnoreCase(header.getName())) {
-
-                            subject = header.getValue();
-                        }
-                    }
-                }
-
-                EmailSignals signals =
-                        extractEmailSignals(fullMessage);
+                progressStage =
+                        "PROCESSING_GMAIL_BATCH_"
+                                + batchNumber
+                                + "_OF_"
+                                + totalBatches;
 
                 System.out.println(
-                        "SmartMail signals: " + signals
+                        "SmartMail: Starting Gmail batch "
+                                + batchNumber
+                                + "/"
+                                + totalBatches
+                                + " ("
+                                + currentBatch.size()
+                                + " message(s))."
                 );
 
-                String body =
-                        extractBody(fullMessage.getPayload());
+                for (Message message : currentBatch) {
 
-                String mimeType =
-                        findBodyMimeType(fullMessage.getPayload());
+                    try {
 
-                var existingEmail =
-                        emailRepository.findByGmailMessageId(
-                                fullMessage.getId());
+                        /*
+                         * RESUME SUPPORT:
+                         *
+                         * A restarted bulk run should not download thousands of
+                         * Gmail bodies that SmartMail already completed.
+                         */
+                        var cachedEmail =
+                                emailRepository.findByGmailMessageId(
+                                        message.getId()
+                                );
 
-                Email email;
+                        if (cachedEmail.isPresent() &&
+                                cachedEmail.get().isAiReviewed()) {
 
-                boolean shouldRunClassification = true;
+                            Email completedEmail =
+                                    cachedEmail.get();
 
-                if (existingEmail.isPresent()) {
+                            if ("TRASH".equalsIgnoreCase(
+                                    completedEmail.getAction()
+                            )) {
 
-                    email = existingEmail.get();
+                                trashMessageById(
+                                        gmail,
+                                        message.getId()
+                                );
 
-                    email.setSender(sender);
-                    email.setSubject(subject);
-                    email.setBody(body);
+                            } else {
 
-                    if (email.isAiReviewed()) {
+                                System.out.println(
+                                        "SmartMail: Skipping already-reviewed Gmail message "
+                                                + message.getId()
+                                );
+                            }
 
-                        shouldRunClassification = false;
+                            int completed =
+                                    progressProcessed.incrementAndGet();
+
+                            System.out.println(
+                                    "SmartMail: Processing progress "
+                                            + completed
+                                            + "/"
+                                            + progressTotal.get()
+                                            + " (failed="
+                                            + progressFailed.get()
+                                            + ")"
+                            );
+
+                            continue;
+                        }
+
+                        Message fullMessage =
+                                getFullMessageWithRetry(
+                                        gmail,
+                                        message.getId()
+                                );
+
+                        String sender = "";
+                        String subject = "";
+
+                        if (fullMessage.getPayload() != null &&
+                                fullMessage.getPayload().getHeaders() != null) {
+
+                            for (var header :
+                                    fullMessage.getPayload().getHeaders()) {
+
+                                if ("From".equalsIgnoreCase(header.getName())) {
+
+                                    sender = header.getValue();
+                                }
+
+                                if ("Subject".equalsIgnoreCase(header.getName())) {
+
+                                    subject = header.getValue();
+                                }
+                            }
+                        }
+
+                        EmailSignals signals =
+                                extractEmailSignals(fullMessage);
 
                         System.out.println(
-                                "SmartMail: Reusing existing result for "
-                                        + email.getGmailMessageId()
+                                "SmartMail signals: " + signals
                         );
 
-                    } else {
+                        String body =
+                                extractBody(fullMessage.getPayload());
 
-                        System.out.println(
-                                "SmartMail: Email requires classification/review: "
-                                        + email.getGmailMessageId()
-                        );
-                    }
+                        String mimeType =
+                                findBodyMimeType(fullMessage.getPayload());
 
-                } else {
+                        var existingEmail =
+                                cachedEmail;
 
-                    email = new Email();
+                        Email email;
 
-                    email.setGmailMessageId(fullMessage.getId());
-                    email.setSender(sender);
-                    email.setSubject(subject);
-                    email.setBody(body);
+                        boolean shouldRunClassification = true;
 
-                    System.out.println(
-                            "SmartMail: New Gmail email detected: "
-                                    + fullMessage.getId()
-                    );
-                }
+                        if (existingEmail.isPresent()) {
 
-                if (shouldRunClassification) {
+                            email = existingEmail.get();
 
-                    email = classifierService.classify(
-                            email,
-                            signals.hasListUnsubscribe,
-                            signals.hasListUnsubscribePost,
-                            signals.bulkMail,
-                            signals.automatedSender,
-                            signals.displayName,
-                            signals.domain,
-                            signals.baseDomain
-                    );
+                            email.setSender(sender);
+                            email.setSubject(subject);
+                            email.setBody(body);
 
-                    emailRepository.save(email);
+                            if (email.isAiReviewed()) {
 
-                } else {
+                                shouldRunClassification = false;
 
-                    emailRepository.save(email);
-                }
+                                System.out.println(
+                                        "SmartMail: Reusing existing result for "
+                                                + email.getGmailMessageId()
+                                );
 
-                if (!email.isAiReviewed() &&
-                        "PENDING_REVIEW".equalsIgnoreCase(
-                                email.getAction())) {
+                            } else {
 
-                    System.out.println(
-                            "SmartMail: Starting AI review for "
-                                    + email.getGmailMessageId()
-                    );
+                                System.out.println(
+                                        "SmartMail: Email requires classification/review: "
+                                                + email.getGmailMessageId()
+                                );
+                            }
 
-                    classifierService.classifyWithAiAsync(
-                            email,
-                            signals.hasListUnsubscribe,
-                            signals.hasListUnsubscribePost,
-                            signals.bulkMail,
-                            signals.automatedSender,
-                            signals.domain,
-                            reviewedEmail -> trashMessage(
+                        } else {
+
+                            email = new Email();
+
+                            email.setGmailMessageId(fullMessage.getId());
+                            email.setSender(sender);
+                            email.setSubject(subject);
+                            email.setBody(body);
+
+                            System.out.println(
+                                    "SmartMail: New Gmail email detected: "
+                                            + fullMessage.getId()
+                            );
+                        }
+
+                        if (shouldRunClassification) {
+
+                            email = classifierService.classify(
+                                    email,
+                                    signals.hasListUnsubscribe,
+                                    signals.hasListUnsubscribePost,
+                                    signals.bulkMail,
+                                    signals.automatedSender,
+                                    signals.displayName,
+                                    signals.domain,
+                                    signals.baseDomain
+                            );
+
+                            emailRepository.save(email);
+
+                        } else {
+
+                            emailRepository.save(email);
+                        }
+
+                        if (!email.isAiReviewed() &&
+                                "PENDING_REVIEW".equalsIgnoreCase(
+                                        email.getAction())) {
+
+                            /*
+                             * Do not start Ollama directly from the normal Gmail fetch.
+                             *
+                             * Large mailboxes can contain many uncertain emails. Starting
+                             * local AI here would keep the GPU under continuous load and
+                             * can also cause semaphore rejections when multiple emails are
+                             * discovered quickly.
+                             *
+                             * Leave uncertain emails as PENDING_REVIEW. They are processed
+                             * separately by PendingReviewService, which uses the controlled
+                             * small-batch/cooling workflow.
+                             */
+                            System.out.println(
+                                    "SmartMail: Queued for controlled AI review: "
+                                            + email.getGmailMessageId()
+                            );
+                        }
+
+                        if ("TRASH".equalsIgnoreCase(email.getAction())) {
+
+                            trashMessage(
                                     gmail,
                                     fullMessage
-                            )
-                    );
-                }
+                            );
+                        }
 
-                if ("TRASH".equalsIgnoreCase(email.getAction())) {
-
-                    trashMessage(
-                            gmail,
-                            fullMessage
-                    );
-                }
-
-                result.append("""
+                        result.append("""
                         <div
                             class="email-card"
                             data-message-id=\"""")
-                        .append(escapeAttribute(email.getGmailMessageId()))
-                        .append("""
+                                .append(escapeAttribute(email.getGmailMessageId()))
+                                .append("""
                         ">
 
                             <div class="email-header">
 
                                 <div class="sender">
                                     From: """)
-                        .append(escapeHtml(email.getSender()))
-                        .append("""
+                                .append(escapeHtml(email.getSender()))
+                                .append("""
                                 </div>
 
                                 <div class="subject">
                                     Subject: """)
-                        .append(escapeHtml(email.getSubject()))
-                        .append("""
+                                .append(escapeHtml(email.getSubject()))
+                                .append("""
                                 </div>
 
                                 <div class="message-id">
                                     Message ID: """)
-                        .append(escapeHtml(email.getGmailMessageId()))
-                        .append("""
+                                .append(escapeHtml(email.getGmailMessageId()))
+                                .append("""
                                 </div>
 
                             </div>
                         """);
 
-                result.append("""
+                        result.append("""
                         <div class="classification">
 
                             <div class="category">
                                 Category:
                                 <span class="category-value">""")
-                        .append(escapeHtml(email.getCategory()))
-                        .append("""
+                                .append(escapeHtml(email.getCategory()))
+                                .append("""
                                 </span>
                             </div>
 
                             <div class="confidence">
                                 Confidence:
                                 <span class="confidence-value">""")
-                        .append(
-                                email.getConfidence() == null
-                                        ? "N/A"
-                                        : email.getConfidence()
-                        )
-                        .append("""
+                                .append(
+                                        email.getConfidence() == null
+                                                ? "N/A"
+                                                : email.getConfidence()
+                                )
+                                .append("""
                                 </span>
                             </div>
 
                             <div class="action">
                                 Action:
                                 <span class="action-value">""")
-                        .append(escapeHtml(email.getAction()))
-                        .append("""
+                                .append(escapeHtml(email.getAction()))
+                                .append("""
                                 </span>
                             </div>
 
                         </div>
                         """);
 
-                result.append("""
+                        result.append("""
                             <div class="email-body">
                         """);
 
-                if ("text/html".equalsIgnoreCase(mimeType)) {
+                        if ("text/html".equalsIgnoreCase(mimeType)) {
 
-                    result.append("<iframe class=\"email-frame\" ")
-                            .append("sandbox=\"allow-same-origin\" ")
-                            .append("onload=\"resizeEmailFrame(this)\" ")
-                            .append("srcdoc=\"")
-                            .append(escapeAttribute(body))
-                            .append("\"></iframe>");
+                            result.append("<iframe class=\"email-frame\" ")
+                                    .append("sandbox=\"allow-same-origin\" ")
+                                    .append("onload=\"resizeEmailFrame(this)\" ")
+                                    .append("srcdoc=\"")
+                                    .append(escapeAttribute(body))
+                                    .append("\"></iframe>");
 
-                } else {
+                        } else {
 
-                    result.append("<div class=\"plain-body\">")
-                            .append(escapeHtml(body))
-                            .append("</div>");
-                }
+                            result.append("<div class=\"plain-body\">")
+                                    .append(escapeHtml(body))
+                                    .append("</div>");
+                        }
 
-                result.append("""
+                        result.append("""
                             </div>
 
                         </div>
                         """);
+
+                        int completed = progressProcessed.incrementAndGet();
+
+                        System.out.println(
+                                "SmartMail: Processing progress "
+                                        + completed
+                                        + "/"
+                                        + progressTotal.get()
+                                        + " (failed="
+                                        + progressFailed.get()
+                                        + ")"
+                        );
+
+                    } catch (Exception messageError) {
+
+                        int failed =
+                                progressFailed.incrementAndGet();
+
+                        int completed =
+                                progressProcessed.incrementAndGet();
+
+                        System.err.println(
+                                "SmartMail: Could not process Gmail message "
+                                        + message.getId()
+                                        + ": "
+                                        + messageError.getMessage()
+                        );
+
+                        System.out.println(
+                                "SmartMail: Processing progress "
+                                        + completed
+                                        + "/"
+                                        + progressTotal.get()
+                                        + " (failed="
+                                        + failed
+                                        + ")"
+                        );
+
+                    } finally {
+
+                        sleepSafely(
+                                MESSAGE_COOLDOWN_MS
+                        );
+                    }
+                }
+
+                System.out.println(
+                        "SmartMail: Completed Gmail batch "
+                                + batchNumber
+                                + "/"
+                                + totalBatches
+                                + "."
+                );
+
+                if (batchEnd < messages.size()) {
+
+                    progressStage =
+                            "COOLING_BETWEEN_GMAIL_BATCHES";
+
+                    sleepSafely(
+                            BATCH_COOLDOWN_MS
+                    );
+                }
             }
 
             result.append("""
@@ -656,9 +901,14 @@ public class GmailService {
                     </html>
                     """);
 
+            progressStage = "GMAIL_BULK_COMPLETE";
+            processing = false;
+
             return result.toString();
 
         } catch (Exception e) {
+            processing = false;
+            progressStage = "ERROR";
 
             e.printStackTrace();
 
@@ -676,6 +926,22 @@ public class GmailService {
                     </html>
                     """;
         }
+    }
+
+
+    // ============================================================
+    // PROCESSING PROGRESS
+    // ============================================================
+
+    public Map<String, Object> getProcessingProgress() {
+
+        return Map.of(
+                "processing", processing,
+                "stage", progressStage,
+                "processed", progressProcessed.get(),
+                "failed", progressFailed.get(),
+                "total", progressTotal.get()
+        );
     }
 
 
@@ -1222,70 +1488,454 @@ public class GmailService {
             return;
         }
 
-        try {
+        List<String> labelIds =
+                message.getLabelIds();
 
-            String messageId =
-                    message.getId();
+        if (labelIds != null &&
+                labelIds.contains("TRASH")) {
 
-            Message currentMessage =
-                    gmail.users()
-                            .messages()
-                            .get(
-                                    "me",
-                                    messageId
-                            )
-                            .setFormat("minimal")
-                            .execute();
+            System.out.println(
+                    "SmartMail: Gmail message "
+                            + message.getId()
+                            + " is already in Trash. "
+                            + "Skipping duplicate action."
+            );
 
-            List<String> labelIds =
-                    currentMessage.getLabelIds();
+            return;
+        }
 
-            if (labelIds != null &&
-                    labelIds.contains("TRASH")) {
+        trashMessageById(
+                gmail,
+                message.getId()
+        );
+    }
+
+
+    // ============================================================
+    // TRASH GMAIL MESSAGE BY ID
+    // ============================================================
+
+    private void trashMessageById(
+            Gmail gmail,
+            String messageId) {
+
+        if (messageId == null ||
+                messageId.isBlank()) {
+
+            return;
+        }
+
+        ModifyMessageRequest modifyRequest =
+                new ModifyMessageRequest()
+                        .setAddLabelIds(
+                                List.of("TRASH")
+                        )
+                        .setRemoveLabelIds(
+                                List.of("INBOX")
+                        );
+
+        int retryCount = 0;
+
+        while (true) {
+
+            try {
+
+                gmail.users()
+                        .messages()
+                        .modify(
+                                "me",
+                                messageId,
+                                modifyRequest
+                        )
+                        .execute();
 
                 System.out.println(
-                        "SmartMail: Gmail message "
+                        "SmartMail: Moved Gmail message to Trash: "
                                 + messageId
-                                + " is already in Trash. "
-                                + "Skipping duplicate action."
                 );
 
                 return;
+
+            } catch (Exception e) {
+
+                if (!isRateLimitException(e) ||
+                        retryCount >= MAX_RATE_LIMIT_RETRIES) {
+
+                    throw new RuntimeException(
+                            "Could not move Gmail message to Trash: "
+                                    + messageId,
+                            e
+                    );
+                }
+
+                retryCount++;
+
+                waitForRateLimitReset(
+                        "trash Gmail message " + messageId,
+                        retryCount
+                );
             }
-
-            ModifyMessageRequest modifyRequest =
-                    new ModifyMessageRequest()
-                            .setAddLabelIds(
-                                    List.of("TRASH")
-                            )
-                            .setRemoveLabelIds(
-                                    List.of("INBOX")
-                            );
-
-            gmail.users()
-                    .messages()
-                    .modify(
-                            "me",
-                            messageId,
-                            modifyRequest
-                    )
-                    .execute();
-
-            System.out.println(
-                    "SmartMail: Moved Gmail message to Trash: "
-                            + messageId
-            );
-
-        } catch (Exception e) {
-
-            System.err.println(
-                    "SmartMail: Failed to move Gmail message to Trash "
-                            + message.getId()
-            );
-
-            e.printStackTrace();
         }
     }
+
+
+    // ============================================================
+    // CREATE REFRESHABLE GOOGLE CREDENTIALS
+    // ============================================================
+
+    private GoogleCredentials createGoogleCredentials(
+            OAuth2AuthorizedClient authorizedClient) {
+
+        String accessTokenValue =
+                authorizedClient
+                        .getAccessToken()
+                        .getTokenValue();
+
+        Date expirationTime =
+                authorizedClient
+                        .getAccessToken()
+                        .getExpiresAt() == null
+                        ? null
+                        : Date.from(
+                        authorizedClient
+                                .getAccessToken()
+                                .getExpiresAt()
+                );
+
+        AccessToken accessToken =
+                new AccessToken(
+                        accessTokenValue,
+                        expirationTime
+                );
+
+        /*
+         * The old implementation used GoogleCredentials.create(accessToken).
+         * That credential cannot refresh itself, which is why a long 2k+
+         * mailbox run started failing when the access token expired.
+         *
+         * If Spring received a Google refresh token, build UserCredentials
+         * so HttpCredentialsAdapter can refresh access tokens automatically.
+         */
+        if (authorizedClient.getRefreshToken() != null &&
+                authorizedClient
+                        .getRefreshToken()
+                        .getTokenValue() != null &&
+                !authorizedClient
+                        .getRefreshToken()
+                        .getTokenValue()
+                        .isBlank()) {
+
+            var registration =
+                    authorizedClient
+                            .getClientRegistration();
+
+            UserCredentials.Builder builder =
+                    UserCredentials
+                            .newBuilder()
+                            .setClientId(
+                                    registration.getClientId()
+                            )
+                            .setClientSecret(
+                                    registration.getClientSecret()
+                            )
+                            .setAccessToken(
+                                    accessToken
+                            )
+                            .setRefreshToken(
+                                    authorizedClient
+                                            .getRefreshToken()
+                                            .getTokenValue()
+                            );
+
+            String tokenUri =
+                    registration
+                            .getProviderDetails()
+                            .getTokenUri();
+
+            if (tokenUri != null &&
+                    !tokenUri.isBlank()) {
+
+                builder.setTokenServerUri(
+                        URI.create(
+                                tokenUri
+                        )
+                );
+            }
+
+            System.out.println(
+                    "SmartMail: Gmail OAuth credentials support automatic access-token refresh."
+            );
+
+            return builder.build();
+        }
+
+        /*
+         * Fallback for accounts where Google did not issue a refresh token.
+         * Resume logic still prevents completed messages from being redone.
+         */
+        System.out.println(
+                "SmartMail: No Google refresh token is available. "
+                        + "Using the current access token for this run."
+        );
+
+        return GoogleCredentials.create(
+                accessToken
+        );
+    }
+
+
+    // ============================================================
+    // CREATE GMAIL CLIENT
+    // ============================================================
+
+    private Gmail createGmailClient(
+            GoogleCredentials credentials)
+            throws Exception {
+
+        return new Gmail.Builder(
+                GoogleNetHttpTransport
+                        .newTrustedTransport(),
+                GsonFactory
+                        .getDefaultInstance(),
+                new HttpCredentialsAdapter(
+                        credentials
+                ))
+                .setApplicationName(
+                        "SmartMail"
+                )
+                .build();
+    }
+
+
+    // ============================================================
+    // GMAIL LIST PAGE WITH RATE-LIMIT RETRY
+    // ============================================================
+
+    private ListMessagesResponse listInboxPageWithRetry(
+            Gmail gmail,
+            String pageToken)
+            throws Exception {
+
+        int retryCount = 0;
+
+        while (true) {
+
+            try {
+
+                return gmail.users()
+                        .messages()
+                        .list("me")
+                        .setLabelIds(
+                                List.of("INBOX")
+                        )
+                        .setMaxResults(50L)
+                        .setPageToken(pageToken)
+                        .execute();
+
+            } catch (Exception e) {
+
+                if (!isRateLimitException(e) ||
+                        retryCount >= MAX_RATE_LIMIT_RETRIES) {
+
+                    throw e;
+                }
+
+                retryCount++;
+
+                waitForRateLimitReset(
+                        "list Gmail inbox page",
+                        retryCount
+                );
+            }
+        }
+    }
+
+
+    // ============================================================
+    // FULL GMAIL MESSAGE WITH RATE-LIMIT RETRY
+    // ============================================================
+
+    private Message getFullMessageWithRetry(
+            Gmail gmail,
+            String messageId)
+            throws Exception {
+
+        int retryCount = 0;
+
+        while (true) {
+
+            try {
+
+                return gmail.users()
+                        .messages()
+                        .get(
+                                "me",
+                                messageId
+                        )
+                        .setFormat("full")
+                        .execute();
+
+            } catch (Exception e) {
+
+                if (!isRateLimitException(e) ||
+                        retryCount >= MAX_RATE_LIMIT_RETRIES) {
+
+                    throw e;
+                }
+
+                retryCount++;
+
+                waitForRateLimitReset(
+                        "read Gmail message " + messageId,
+                        retryCount
+                );
+            }
+        }
+    }
+
+
+    // ============================================================
+    // RATE LIMIT DETECTION
+    // ============================================================
+
+    private boolean isRateLimitException(
+            Throwable throwable) {
+
+        Throwable current =
+                throwable;
+
+        while (current != null) {
+
+            if (current instanceof GoogleJsonResponseException responseException) {
+
+                int statusCode =
+                        responseException.getStatusCode();
+
+                String content =
+                        responseException.getContent();
+
+                String normalizedContent =
+                        content == null
+                                ? ""
+                                : content.toLowerCase(
+                                Locale.ROOT
+                        );
+
+                if (statusCode == 429) {
+
+                    return true;
+                }
+
+                if (statusCode == 403 &&
+                        (normalizedContent.contains(
+                                "ratelimitexceeded"
+                        ) ||
+                                normalizedContent.contains(
+                                        "rate_limit_exceeded"
+                                ) ||
+                                normalizedContent.contains(
+                                        "quota exceeded"
+                                ))) {
+
+                    return true;
+                }
+            }
+
+            String message =
+                    current.getMessage();
+
+            if (message != null) {
+
+                String normalizedMessage =
+                        message.toLowerCase(
+                                Locale.ROOT
+                        );
+
+                if (normalizedMessage.contains(
+                        "rate_limit_exceeded"
+                ) ||
+                        normalizedMessage.contains(
+                                "ratelimitexceeded"
+                        ) ||
+                        normalizedMessage.contains(
+                                "quota exceeded"
+                        ) ||
+                        normalizedMessage.contains(
+                                "too many requests"
+                        )) {
+
+                    return true;
+                }
+            }
+
+            current =
+                    current.getCause();
+        }
+
+        return false;
+    }
+
+
+    // ============================================================
+    // RATE LIMIT BACKOFF
+    // ============================================================
+
+    private void waitForRateLimitReset(
+            String operation,
+            int retryNumber) {
+
+        String previousStage =
+                progressStage;
+
+        progressStage =
+                "GMAIL_RATE_LIMIT_BACKOFF";
+
+        System.out.println(
+                "SmartMail: Gmail rate limit reached while trying to "
+                        + operation
+                        + ". Waiting "
+                        + (RATE_LIMIT_BACKOFF_MS / 1000)
+                        + " seconds before retry "
+                        + retryNumber
+                        + "/"
+                        + MAX_RATE_LIMIT_RETRIES
+                        + "."
+        );
+
+        sleepSafely(
+                RATE_LIMIT_BACKOFF_MS
+        );
+
+        progressStage =
+                previousStage;
+    }
+
+
+    // ============================================================
+    // SAFE PAUSE
+    // ============================================================
+
+    private void sleepSafely(
+            long milliseconds) {
+
+        try {
+
+            Thread.sleep(
+                    milliseconds
+            );
+
+        } catch (InterruptedException e) {
+
+            Thread.currentThread()
+                    .interrupt();
+
+            throw new IllegalStateException(
+                    "Gmail processing was interrupted.",
+                    e
+            );
+        }
+    }
+
 
 
     // ============================================================

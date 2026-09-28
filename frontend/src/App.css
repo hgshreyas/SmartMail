@@ -748,3 +748,107 @@
   border-radius: 10px;
   background: white;
 }
+
+/* =========================================================
+   FINAL DASHBOARD STATUS
+========================================================= */
+
+.refresh-button:disabled {
+  opacity: 0.65;
+  cursor: wait;
+  transform: none;
+}
+
+.connection-offline {
+  background: #fff0f0;
+  color: #b43737;
+}
+
+.connection-offline .connection-dot {
+  background: #d94a4a;
+}
+
+.system-status {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.status-item {
+  min-height: 70px;
+  padding: 14px 16px;
+  border: 1px solid #e3e7ee;
+  border-radius: 12px;
+  background: #ffffff;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.status-item small {
+  display: block;
+  margin-bottom: 4px;
+  color: #8992a3;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.45px;
+}
+
+.status-item strong {
+  display: block;
+  color: #2d374b;
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.status-dot {
+  width: 9px;
+  height: 9px;
+  min-width: 9px;
+  border-radius: 50%;
+  background: #2eae68;
+  box-shadow: 0 0 0 4px rgba(46, 174, 104, 0.1);
+}
+
+.status-error .status-dot {
+  background: #d94a4a;
+  box-shadow: 0 0 0 4px rgba(217, 74, 74, 0.1);
+}
+
+.status-working {
+  border-color: #cfd8fb;
+  background: #f7f9ff;
+}
+
+.status-working strong {
+  color: #3157d5;
+}
+
+.status-updated strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.ai-queued {
+  color: #3157d5;
+  font-weight: 650;
+}
+
+@media (max-width: 1000px) {
+  .system-status {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .system-status {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 460px) {
+  .system-status {
+    grid-template-columns: 1fr;
+  }
+}
