@@ -136,13 +136,13 @@ public class SecurityConfig {
     // ============================================================
 
     /*
-     * CORS configuration for the React frontend.
+     * Allowed React frontends:
      *
-     * React:
+     * Local development:
      * http://localhost:5173
      *
-     * Spring Boot:
-     * http://localhost:8080
+     * Production Vercel deployment:
+     * https://smart-mail-ro8zxg3sz-smart-mail.vercel.app
      */
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
@@ -152,7 +152,8 @@ public class SecurityConfig {
 
         configuration.setAllowedOrigins(
                 List.of(
-                        "http://localhost:5173"
+                        "http://localhost:5173",
+                        "https://smart-mail-ro8zxg3sz-smart-mail.vercel.app"
                 )
         );
 
@@ -170,6 +171,13 @@ public class SecurityConfig {
                 List.of("*")
         );
 
+        /*
+         * Required because the React frontend uses:
+         *
+         * credentials: "include"
+         *
+         * for OAuth-backed backend requests.
+         */
         configuration.setAllowCredentials(
                 true
         );
