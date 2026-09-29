@@ -5,6 +5,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -14,29 +15,41 @@ import org.springframework.stereotype.Service;
 @Service
 public class OllamaClassificationService {
 
+    // ============================================================
+    // LOCAL OLLAMA CONFIGURATION
+    // ============================================================
+
     private static final String OLLAMA_URL =
             "http://localhost:11434/api/generate";
 
     private static final String OLLAMA_MODEL =
             "llama3.2:1b";
 
-    // Keep the prompt reasonably small so Ollama can respond faster.
+
+    // ============================================================
+    // CLOUD GEMINI CONFIGURATION
+    // ============================================================
+
+    private static final String GEMINI_API_BASE =
+            "https://generativelanguage.googleapis.com/v1beta/models/";
+
+    private static final String DEFAULT_GEMINI_MODEL =
+            "gemini-3.8-flash";
+
+
+    // Keep AI input reasonably small.
     private static final int MAX_BODY_LENGTH = 1000;
 
+
     /*
-     * Dedicated executor for Ollama requests.
+     * One AI request at a time.
      *
-     * IMPORTANT:
+     * This is important locally because Ollama can be resource intensive.
      *
-     * Ollama calls are blocking HTTP operations.
-     *
-     * We therefore DO NOT use Java's common ForkJoinPool.
-     *
-     * Only 1 Ollama request is allowed to run at a time.
-     * Remaining requests wait safely in the executor queue.
-     * This keeps local AI load low on lightweight hardware.
+     * It is also useful in production because it prevents a large pending
+     * backlog from sending hundreds of Gemini requests simultaneously.
      */
-    private final ExecutorService ollamaExecutor =
+    private final ExecutorService aiExecutor =
             Executors.newFixedThreadPool(
                     1,
                     runnable -> {
@@ -44,7 +57,7 @@ public class OllamaClassificationService {
                         Thread thread =
                                 new Thread(
                                         runnable,
-                                        "smartmail-ollama-worker"
+                                        "smartmail-ai-worker"
                                 );
 
                         thread.setDaemon(true);
@@ -53,14 +66,80 @@ public class OllamaClassificationService {
                     }
             );
 
+
     private final HttpClient httpClient;
+
+    private final String aiProvider;
+    private final String geminiApiKey;
+    private final String geminiModel;
+
 
     public OllamaClassificationService() {
 
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(5))
-                .build();
+        this.httpClient =
+                HttpClient.newBuilder()
+                        .connectTimeout(
+                                Duration.ofSeconds(10)
+                        )
+                        .build();
+
+
+        /*
+         * LOCAL:
+         *
+         * AI_PROVIDER is normally absent, therefore SmartMail defaults
+         * to Ollama exactly as before.
+         *
+         * RENDER:
+         *
+         * AI_PROVIDER=gemini
+         *
+         * Therefore the deployed application uses Gemini instead of
+         * attempting to contact localhost:11434.
+         */
+        this.aiProvider =
+                readEnvironmentVariable(
+                        "AI_PROVIDER",
+                        "ollama"
+                )
+                        .toLowerCase(
+                                Locale.ROOT
+                        );
+
+
+        this.geminiApiKey =
+                readEnvironmentVariable(
+                        "GEMINI_API_KEY",
+                        ""
+                );
+
+
+        this.geminiModel =
+                readEnvironmentVariable(
+                        "GEMINI_MODEL",
+                        DEFAULT_GEMINI_MODEL
+                );
+
+
+        System.out.println(
+                "SmartMail: AI provider = "
+                        + aiProvider
+        );
+
+
+        if ("gemini".equals(aiProvider)) {
+
+            System.out.println(
+                    "SmartMail: Gemini model = "
+                            + geminiModel
+            );
+        }
     }
+
+
+    // ============================================================
+    // SYNCHRONOUS CLASSIFICATION
+    // ============================================================
 
     public String classify(
             String sender,
@@ -72,41 +151,40 @@ public class OllamaClassificationService {
             boolean bulkMail,
             boolean automatedSender) {
 
-        String prompt = buildPrompt(
-                sender,
-                domain,
-                subject,
-                body,
-                hasListUnsubscribe,
-                hasListUnsubscribePost,
-                bulkMail,
-                automatedSender
-        );
+        String prompt =
+                buildPrompt(
+                        sender,
+                        domain,
+                        subject,
+                        body,
+                        hasListUnsubscribe,
+                        hasListUnsubscribePost,
+                        bulkMail,
+                        automatedSender
+                );
+
 
         try {
 
-            String result =
-                    callOllama(prompt).join();
-
-            if (result != null) {
-
-                System.out.println(
-                        "SmartMail Ollama response received."
-                );
-            }
-
-            return result;
+            return callAi(
+                    prompt
+            ).join();
 
         } catch (Exception e) {
 
-            System.out.println(
-                    "SmartMail Ollama error: " +
-                            e.getMessage()
+            System.err.println(
+                    "SmartMail AI error: "
+                            + e.getMessage()
             );
 
             return null;
         }
     }
+
+
+    // ============================================================
+    // ASYNCHRONOUS CLASSIFICATION
+    // ============================================================
 
     public CompletableFuture<String> classifyAsync(
             String sender,
@@ -118,172 +196,420 @@ public class OllamaClassificationService {
             boolean bulkMail,
             boolean automatedSender) {
 
-        String prompt = buildPrompt(
-                sender,
-                domain,
-                subject,
-                body,
-                hasListUnsubscribe,
-                hasListUnsubscribePost,
-                bulkMail,
-                automatedSender
-        );
+        String prompt =
+                buildPrompt(
+                        sender,
+                        domain,
+                        subject,
+                        body,
+                        hasListUnsubscribe,
+                        hasListUnsubscribePost,
+                        bulkMail,
+                        automatedSender
+                );
 
-        return callOllama(prompt);
+
+        return callAi(
+                prompt
+        );
     }
 
-    private CompletableFuture<String> callOllama(
+
+    // ============================================================
+    // SELECT AI PROVIDER
+    // ============================================================
+
+    private CompletableFuture<String> callAi(
             String prompt) {
 
         return CompletableFuture.supplyAsync(
                 () -> {
 
-                    long startTime =
-                            System.currentTimeMillis();
+                    if ("gemini".equals(
+                            aiProvider
+                    )) {
 
-                    try {
-
-                        String escapedPrompt =
-                                escapeJson(prompt);
-
-                        String requestBody =
-                                "{"
-                                        + "\"model\":\""
-                                        + OLLAMA_MODEL
-                                        + "\","
-                                        + "\"prompt\":\""
-                                        + escapedPrompt
-                                        + "\","
-                                        + "\"stream\":false,"
-                                        + "\"format\":{"
-                                        + "\"type\":\"object\","
-                                        + "\"properties\":{"
-                                        + "\"category\":{"
-                                        + "\"type\":\"string\","
-                                        + "\"enum\":[\"IMPORTANT\",\"PROMOTIONAL\",\"SPAM\"]"
-                                        + "},"
-                                        + "\"confidence\":{"
-                                        + "\"type\":\"number\","
-                                        + "\"minimum\":0,"
-                                        + "\"maximum\":1"
-                                        + "},"
-                                        + "\"reason\":{"
-                                        + "\"type\":\"string\""
-                                        + "}"
-                                        + "},"
-                                        + "\"required\":[\"category\",\"confidence\",\"reason\"],"
-                                        + "\"additionalProperties\":false"
-                                        + "},"
-                                        + "\"keep_alive\":\"1m\","
-                                        + "\"options\":{"
-                                        + "\"temperature\":0,"
-                                        + "\"num_ctx\":2048,"
-                                        + "\"num_predict\":96"
-                                        + "}"
-                                        + "}";
-
-                        HttpRequest request =
-                                HttpRequest.newBuilder()
-                                        .uri(
-                                                URI.create(
-                                                        OLLAMA_URL
-                                                )
-                                        )
-                                        .timeout(
-                                                Duration.ofSeconds(180)
-                                        )
-                                        .header(
-                                                "Content-Type",
-                                                "application/json"
-                                        )
-                                        .POST(
-                                                HttpRequest.BodyPublishers
-                                                        .ofString(
-                                                                requestBody
-                                                        )
-                                        )
-                                        .build();
-
-                        System.out.println(
-                                "SmartMail: Sending request to Ollama..."
+                        return callGemini(
+                                prompt
                         );
-
-                        HttpResponse<String> response =
-                                httpClient.send(
-                                        request,
-                                        HttpResponse.BodyHandlers
-                                                .ofString()
-                                );
-
-                        long elapsed =
-                                System.currentTimeMillis()
-                                        - startTime;
-
-                        System.out.println(
-                                "SmartMail: Ollama request completed in "
-                                        + elapsed
-                                        + " ms."
-                        );
-
-                        if (response.statusCode() != 200) {
-
-                            System.out.println(
-                                    "SmartMail Ollama HTTP error: "
-                                            + response.statusCode()
-                            );
-
-                            System.out.println(
-                                    response.body()
-                            );
-
-                            return null;
-                        }
-
-                        String responseBody =
-                                response.body();
-
-                        String generatedText =
-                                extractResponse(
-                                        responseBody
-                                );
-
-                        if (generatedText == null ||
-                                generatedText.isBlank()) {
-
-                            System.out.println(
-                                    "SmartMail Ollama returned " +
-                                            "an empty response."
-                            );
-
-                            return null;
-                        }
-
-                        System.out.println(
-                                "SmartMail Ollama response received."
-                        );
-
-                        return generatedText;
-
-                    } catch (Exception e) {
-
-                        long elapsed =
-                                System.currentTimeMillis()
-                                        - startTime;
-
-                        System.out.println(
-                                "SmartMail Ollama request failed " +
-                                        "after "
-                                        + elapsed
-                                        + " ms: "
-                                        + e.getMessage()
-                        );
-
-                        return null;
                     }
+
+
+                    /*
+                     * Default provider remains Ollama.
+                     *
+                     * This means local development continues working
+                     * without requiring any new local environment variable.
+                     */
+                    return callOllama(
+                            prompt
+                    );
                 },
-                ollamaExecutor
+                aiExecutor
         );
     }
+
+
+    // ============================================================
+    // OLLAMA
+    // ============================================================
+
+    private String callOllama(
+            String prompt) {
+
+        long startTime =
+                System.currentTimeMillis();
+
+
+        try {
+
+            String escapedPrompt =
+                    escapeJson(
+                            prompt
+                    );
+
+
+            String requestBody =
+                    "{"
+                            + "\"model\":\""
+                            + OLLAMA_MODEL
+                            + "\","
+                            + "\"prompt\":\""
+                            + escapedPrompt
+                            + "\","
+                            + "\"stream\":false,"
+                            + "\"format\":{"
+                            + "\"type\":\"object\","
+                            + "\"properties\":{"
+                            + "\"category\":{"
+                            + "\"type\":\"string\","
+                            + "\"enum\":[\"IMPORTANT\",\"PROMOTIONAL\",\"SPAM\"]"
+                            + "},"
+                            + "\"confidence\":{"
+                            + "\"type\":\"number\","
+                            + "\"minimum\":0,"
+                            + "\"maximum\":1"
+                            + "},"
+                            + "\"reason\":{"
+                            + "\"type\":\"string\""
+                            + "}"
+                            + "},"
+                            + "\"required\":[\"category\",\"confidence\",\"reason\"],"
+                            + "\"additionalProperties\":false"
+                            + "},"
+                            + "\"keep_alive\":\"1m\","
+                            + "\"options\":{"
+                            + "\"temperature\":0,"
+                            + "\"num_ctx\":2048,"
+                            + "\"num_predict\":96"
+                            + "}"
+                            + "}";
+
+
+            HttpRequest request =
+                    HttpRequest.newBuilder()
+                            .uri(
+                                    URI.create(
+                                            OLLAMA_URL
+                                    )
+                            )
+                            .timeout(
+                                    Duration.ofSeconds(
+                                            180
+                                    )
+                            )
+                            .header(
+                                    "Content-Type",
+                                    "application/json"
+                            )
+                            .POST(
+                                    HttpRequest.BodyPublishers
+                                            .ofString(
+                                                    requestBody
+                                            )
+                            )
+                            .build();
+
+
+            System.out.println(
+                    "SmartMail: Sending request to Ollama..."
+            );
+
+
+            HttpResponse<String> response =
+                    httpClient.send(
+                            request,
+                            HttpResponse.BodyHandlers
+                                    .ofString()
+                    );
+
+
+            long elapsed =
+                    System.currentTimeMillis()
+                            - startTime;
+
+
+            System.out.println(
+                    "SmartMail: Ollama request completed in "
+                            + elapsed
+                            + " ms."
+            );
+
+
+            if (response.statusCode() != 200) {
+
+                System.err.println(
+                        "SmartMail Ollama HTTP error: "
+                                + response.statusCode()
+                );
+
+                return null;
+            }
+
+
+            String generatedText =
+                    extractJsonStringField(
+                            response.body(),
+                            "response"
+                    );
+
+
+            if (generatedText == null ||
+                    generatedText.isBlank()) {
+
+                System.err.println(
+                        "SmartMail: Ollama returned an empty response."
+                );
+
+                return null;
+            }
+
+
+            return generatedText.trim();
+
+
+        } catch (Exception e) {
+
+            long elapsed =
+                    System.currentTimeMillis()
+                            - startTime;
+
+
+            System.err.println(
+                    "SmartMail: Ollama request failed after "
+                            + elapsed
+                            + " ms: "
+                            + e.getMessage()
+            );
+
+
+            return null;
+        }
+    }
+
+
+    // ============================================================
+    // GEMINI
+    // ============================================================
+
+    private String callGemini(
+            String prompt) {
+
+        long startTime =
+                System.currentTimeMillis();
+
+
+        if (geminiApiKey == null ||
+                geminiApiKey.isBlank()) {
+
+            System.err.println(
+                    "SmartMail: GEMINI_API_KEY is missing."
+            );
+
+            return null;
+        }
+
+
+        try {
+
+            String escapedPrompt =
+                    escapeJson(
+                            prompt
+                    );
+
+
+            /*
+             * responseMimeType requests JSON output.
+             *
+             * EmailClassifierService already validates the returned
+             * category/confidence/reason structure, so both Ollama and
+             * Gemini feed into exactly the same downstream logic.
+             */
+            String requestBody =
+                    "{"
+                            + "\"contents\":["
+                            + "{"
+                            + "\"role\":\"user\","
+                            + "\"parts\":["
+                            + "{"
+                            + "\"text\":\""
+                            + escapedPrompt
+                            + "\""
+                            + "}"
+                            + "]"
+                            + "}"
+                            + "],"
+                            + "\"generationConfig\":{"
+                            + "\"temperature\":0,"
+                            + "\"maxOutputTokens\":256,"
+                            + "\"responseMimeType\":\"application/json\""
+                            + "}"
+                            + "}";
+
+
+            String endpoint =
+                    GEMINI_API_BASE
+                            + geminiModel
+                            + ":generateContent";
+
+
+            HttpRequest request =
+                    HttpRequest.newBuilder()
+                            .uri(
+                                    URI.create(
+                                            endpoint
+                                    )
+                            )
+                            .timeout(
+                                    Duration.ofSeconds(
+                                            180
+                                    )
+                            )
+                            .header(
+                                    "Content-Type",
+                                    "application/json"
+                            )
+                            .header(
+                                    "x-goog-api-key",
+                                    geminiApiKey
+                            )
+                            .POST(
+                                    HttpRequest.BodyPublishers
+                                            .ofString(
+                                                    requestBody
+                                            )
+                            )
+                            .build();
+
+
+            System.out.println(
+                    "SmartMail: Sending request to Gemini..."
+            );
+
+
+            HttpResponse<String> response =
+                    httpClient.send(
+                            request,
+                            HttpResponse.BodyHandlers
+                                    .ofString()
+                    );
+
+
+            long elapsed =
+                    System.currentTimeMillis()
+                            - startTime;
+
+
+            System.out.println(
+                    "SmartMail: Gemini request completed in "
+                            + elapsed
+                            + " ms."
+            );
+
+
+            if (response.statusCode() != 200) {
+
+                System.err.println(
+                        "SmartMail Gemini HTTP error: "
+                                + response.statusCode()
+                );
+
+
+                /*
+                 * Do not print the request or API key.
+                 *
+                 * The response body is useful for diagnosing issues such as
+                 * invalid model names or quota problems.
+                 */
+                System.err.println(
+                        response.body()
+                );
+
+
+                return null;
+            }
+
+
+            /*
+             * Gemini generateContent returns:
+             *
+             * candidates
+             *   -> content
+             *      -> parts
+             *         -> text
+             *
+             * Because this request is text-only, extracting the first
+             * "text" field gives us the model's JSON classification.
+             */
+            String generatedText =
+                    extractJsonStringField(
+                            response.body(),
+                            "text"
+                    );
+
+
+            if (generatedText == null ||
+                    generatedText.isBlank()) {
+
+                System.err.println(
+                        "SmartMail: Gemini returned an empty response."
+                );
+
+                return null;
+            }
+
+
+            System.out.println(
+                    "SmartMail: Gemini response received."
+            );
+
+
+            return generatedText.trim();
+
+
+        } catch (Exception e) {
+
+            long elapsed =
+                    System.currentTimeMillis()
+                            - startTime;
+
+
+            System.err.println(
+                    "SmartMail: Gemini request failed after "
+                            + elapsed
+                            + " ms: "
+                            + e.getMessage()
+            );
+
+
+            return null;
+        }
+    }
+
+
+    // ============================================================
+    // PROMPT
+    // ============================================================
 
     private String buildPrompt(
             String sender,
@@ -296,7 +622,10 @@ public class OllamaClassificationService {
             boolean automatedSender) {
 
         String safeBody =
-                limitBody(body);
+                limitBody(
+                        body
+                );
+
 
         return """
                 Classify this email into exactly one category:
@@ -334,8 +663,14 @@ public class OllamaClassificationService {
                 Body:
                 %s
 
-                Return exactly these fields:
-                category, confidence, reason.
+                Return ONLY a JSON object with exactly these fields:
+
+                {
+                  "category": "IMPORTANT or PROMOTIONAL or SPAM",
+                  "confidence": 0.0,
+                  "reason": "short reason"
+                }
+
                 Confidence must be a number from 0.0 to 1.0.
                 """.formatted(
                 hasListUnsubscribe,
@@ -349,25 +684,36 @@ public class OllamaClassificationService {
         );
     }
 
-    private String limitBody(String body) {
 
-        if (body == null || body.isBlank()) {
+    // ============================================================
+    // BODY LIMIT
+    // ============================================================
+
+    private String limitBody(
+            String body) {
+
+        if (body == null ||
+                body.isBlank()) {
 
             return "";
         }
 
-        if (body.length() <= MAX_BODY_LENGTH) {
+
+        if (body.length() <=
+                MAX_BODY_LENGTH) {
 
             return body;
         }
 
+
         System.out.println(
-                "SmartMail: Email body truncated for Ollama from "
+                "SmartMail: Email body truncated for AI from "
                         + body.length()
                         + " to "
                         + MAX_BODY_LENGTH
                         + " characters."
         );
+
 
         return body.substring(
                 0,
@@ -375,31 +721,80 @@ public class OllamaClassificationService {
         );
     }
 
-    private String extractResponse(String json) {
 
-        if (json == null || json.isBlank()) {
+    // ============================================================
+    // READ ENVIRONMENT VARIABLE
+    // ============================================================
+
+    private String readEnvironmentVariable(
+            String key,
+            String defaultValue) {
+
+        String value =
+                System.getenv(
+                        key
+                );
+
+
+        if (value == null ||
+                value.isBlank()) {
+
+            return defaultValue;
+        }
+
+
+        return value.trim();
+    }
+
+
+    // ============================================================
+    // EXTRACT JSON STRING FIELD
+    // ============================================================
+
+    private String extractJsonStringField(
+            String json,
+            String fieldName) {
+
+        if (json == null ||
+                json.isBlank() ||
+                fieldName == null ||
+                fieldName.isBlank()) {
 
             return null;
         }
 
-        int responseIndex =
-                json.indexOf("\"response\"");
 
-        if (responseIndex == -1) {
+        String field =
+                "\""
+                        + fieldName
+                        + "\"";
+
+
+        int fieldIndex =
+                json.indexOf(
+                        field
+                );
+
+
+        if (fieldIndex == -1) {
 
             return null;
         }
+
 
         int colonIndex =
                 json.indexOf(
                         ':',
-                        responseIndex
+                        fieldIndex
+                                + field.length()
                 );
+
 
         if (colonIndex == -1) {
 
             return null;
         }
+
 
         int firstQuote =
                 json.indexOf(
@@ -407,120 +802,240 @@ public class OllamaClassificationService {
                         colonIndex + 1
                 );
 
+
         if (firstQuote == -1) {
 
             return null;
         }
 
+
         StringBuilder result =
                 new StringBuilder();
 
-        boolean escaped = false;
+
+        boolean escaped =
+                false;
+
 
         for (int i = firstQuote + 1;
              i < json.length();
              i++) {
 
+
             char c =
-                    json.charAt(i);
+                    json.charAt(
+                            i
+                    );
+
 
             if (escaped) {
 
-                if (c == 'n') {
+                switch (c) {
 
-                    result.append('\n');
+                    case 'n' ->
+                            result.append(
+                                    '\n'
+                            );
 
-                } else if (c == 'r') {
+                    case 'r' ->
+                            result.append(
+                                    '\r'
+                            );
 
-                    result.append('\r');
+                    case 't' ->
+                            result.append(
+                                    '\t'
+                            );
 
-                } else if (c == 't') {
+                    case 'b' ->
+                            result.append(
+                                    '\b'
+                            );
 
-                    result.append('\t');
+                    case 'f' ->
+                            result.append(
+                                    '\f'
+                            );
 
-                } else if (c == '"') {
+                    case '"' ->
+                            result.append(
+                                    '"'
+                            );
 
-                    result.append('"');
+                    case '\\' ->
+                            result.append(
+                                    '\\'
+                            );
 
-                } else if (c == '\\') {
+                    case '/' ->
+                            result.append(
+                                    '/'
+                            );
 
-                    result.append('\\');
+                    case 'u' -> {
 
-                } else {
+                        /*
+                         * Decode JSON Unicode escapes.
+                         */
+                        if (i + 4 <
+                                json.length()) {
 
-                    result.append(c);
+                            String hex =
+                                    json.substring(
+                                            i + 1,
+                                            i + 5
+                                    );
+
+
+                            try {
+
+                                int codePoint =
+                                        Integer.parseInt(
+                                                hex,
+                                                16
+                                        );
+
+
+                                result.append(
+                                        (char) codePoint
+                                );
+
+
+                                i += 4;
+
+
+                            } catch (NumberFormatException e) {
+
+                                result.append(
+                                        "\\u"
+                                );
+
+                                result.append(
+                                        hex
+                                );
+
+
+                                i += 4;
+                            }
+
+                        } else {
+
+                            result.append(
+                                    'u'
+                            );
+                        }
+                    }
+
+
+                    default ->
+                            result.append(
+                                    c
+                            );
                 }
 
-                escaped = false;
+
+                escaped =
+                        false;
+
 
             } else if (c == '\\') {
 
-                escaped = true;
+                escaped =
+                        true;
+
 
             } else if (c == '"') {
 
                 break;
 
+
             } else {
 
-                result.append(c);
+                result.append(
+                        c
+                );
             }
         }
 
-        return result.toString().trim();
+
+        return result
+                .toString()
+                .trim();
     }
 
-    private String escapeJson(String value) {
+
+    // ============================================================
+    // JSON ESCAPING
+    // ============================================================
+
+    private String escapeJson(
+            String value) {
 
         if (value == null) {
 
             return "";
         }
 
+
         StringBuilder escaped =
                 new StringBuilder(
                         value.length() + 32
                 );
 
+
         for (int i = 0;
              i < value.length();
              i++) {
 
+
             char c =
-                    value.charAt(i);
+                    value.charAt(
+                            i
+                    );
+
 
             switch (c) {
 
                 case '\\' ->
-                        escaped.append("\\\\");
+                        escaped.append(
+                                "\\\\"
+                        );
 
                 case '"' ->
-                        escaped.append("\\\"");
+                        escaped.append(
+                                "\\\""
+                        );
 
                 case '\b' ->
-                        escaped.append("\\b");
+                        escaped.append(
+                                "\\b"
+                        );
 
                 case '\f' ->
-                        escaped.append("\\f");
+                        escaped.append(
+                                "\\f"
+                        );
 
                 case '\n' ->
-                        escaped.append("\\n");
+                        escaped.append(
+                                "\\n"
+                        );
 
                 case '\r' ->
-                        escaped.append("\\r");
+                        escaped.append(
+                                "\\r"
+                        );
 
                 case '\t' ->
-                        escaped.append("\\t");
+                        escaped.append(
+                                "\\t"
+                        );
 
                 default -> {
 
                     /*
-                     * JSON does not allow raw control characters
-                     * U+0000 through U+001F inside a string.
-                     *
-                     * Gmail bodies can occasionally contain one of
-                     * these characters, so encode any remaining
-                     * control character using a Unicode escape.
+                     * JSON strings cannot contain raw control
+                     * characters U+0000 through U+001F.
                      */
                     if (c < 0x20) {
 
@@ -533,11 +1048,14 @@ public class OllamaClassificationService {
 
                     } else {
 
-                        escaped.append(c);
+                        escaped.append(
+                                c
+                        );
                     }
                 }
             }
         }
+
 
         return escaped.toString();
     }
