@@ -27,18 +27,9 @@ public class SecurityConfig {
             throws Exception {
 
         http
-                /*
-                 * Allow requests from the React frontend.
-                 */
                 .cors(cors -> {
                 })
 
-                /*
-                 * React sends POST requests for Keep/Trash.
-                 * CSRF is disabled because SmartMail uses
-                 * OAuth2 for Gmail access rather than
-                 * browser form authentication.
-                 */
                 .csrf(csrf -> csrf.disable())
 
                 .authorizeHttpRequests(auth -> auth
@@ -48,23 +39,6 @@ public class SecurityConfig {
                 .formLogin(form -> {
                 })
 
-                /*
-                 * Google OAuth login.
-                 *
-                 * SmartMail performs long-running Gmail operations.
-                 * Therefore we explicitly request:
-                 *
-                 * access_type=offline
-                 *     -> asks Google for a refresh token.
-                 *
-                 * prompt=consent
-                 *     -> forces the Google consent screen so an account
-                 *        that previously authorized SmartMail can receive
-                 *        a refresh token.
-                 *
-                 * include_granted_scopes=true
-                 *     -> preserves previously granted permissions.
-                 */
                 .oauth2Login(oauth -> oauth
                         .authorizationEndpoint(
                                 authorization -> authorization
@@ -135,15 +109,6 @@ public class SecurityConfig {
     // CORS
     // ============================================================
 
-    /*
-     * Allowed React frontends:
-     *
-     * Local development:
-     * http://localhost:5173
-     *
-     * Production Vercel deployment:
-     * https://smart-mail-ro8zxg3sz-smart-mail.vercel.app
-     */
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
 
@@ -153,7 +118,7 @@ public class SecurityConfig {
         configuration.setAllowedOrigins(
                 List.of(
                         "http://localhost:5173",
-                        "https://smart-mail-ro8zxg3sz-smart-mail.vercel.app"
+                        "https://smart-mail-wheat.vercel.app"
                 )
         );
 
@@ -171,13 +136,6 @@ public class SecurityConfig {
                 List.of("*")
         );
 
-        /*
-         * Required because the React frontend uses:
-         *
-         * credentials: "include"
-         *
-         * for OAuth-backed backend requests.
-         */
         configuration.setAllowCredentials(
                 true
         );
