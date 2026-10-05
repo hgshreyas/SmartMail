@@ -13,6 +13,7 @@ import com.google.auth.oauth2.UserCredentials;
 
 import com.smartmail.backend.model.Email;
 import com.smartmail.backend.repository.EmailRepository;
+import com.smartmail.backend.model.AppUser;
 
 import org.springframework.security.oauth2.client.OAuth2AuthorizedClient;
 import org.springframework.stereotype.Service;
@@ -86,6 +87,7 @@ public class PendingReviewService {
             new AtomicInteger(0);
 
     private volatile String stage = "IDLE";
+    private volatile Long progressOwnerId;
 
 
     public PendingReviewService(
@@ -102,7 +104,8 @@ public class PendingReviewService {
     // ============================================================
 
     public boolean startProcessing(
-            OAuth2AuthorizedClient authorizedClient) {
+            OAuth2AuthorizedClient authorizedClient,
+            AppUser owner) {
 
         if (authorizedClient == null) {
 
@@ -127,13 +130,15 @@ public class PendingReviewService {
         failed.set(0);
 
         stage = "STARTING";
+        progressOwnerId = owner.getId();
 
         CompletableFuture.runAsync(() -> {
 
             try {
 
                 processPendingEmails(
-                        authorizedClient
+                        authorizedClient,
+                        owner
                 );
 
             } catch (Exception e) {
@@ -167,7 +172,8 @@ public class PendingReviewService {
     // ============================================================
 
     private void processPendingEmails(
-            OAuth2AuthorizedClient authorizedClient)
+            OAuth2AuthorizedClient authorizedClient,
+            AppUser owner)
             throws Exception {
 
         stage = "LOADING_PENDING_EMAILS";
@@ -176,7 +182,7 @@ public class PendingReviewService {
                 new ArrayList<>();
 
         for (Email candidate :
-                emailRepository.findAll()) {
+                emailRepository.findByOwnerOrderByIdAsc(owner)) {
 
             if (candidate != null &&
                     "PENDING_REVIEW".equalsIgnoreCase(
@@ -346,9 +352,7 @@ public class PendingReviewService {
 
             Email email =
                     emailRepository
-                            .findById(
-                                    originalEmail.getId()
-                            )
+                            .findByIdAndOwner(originalEmail.getId(), owner)
                             .orElse(null);
 
             if (email == null) {
@@ -629,9 +633,7 @@ public class PendingReviewService {
 
             Email selectedEmail =
                     emailRepository
-                            .findById(
-                                    selectedId
-                            )
+                            .findByIdAndOwner(selectedId, owner)
                             .orElse(null);
 
 
@@ -678,9 +680,7 @@ public class PendingReviewService {
              * Wait for THIS email before submitting another one.
              */
             waitForBatch(
-                    List.of(
-                            selectedId
-                    )
+                    List.of(selectedId), owner
             );
         }
 
@@ -691,8 +691,8 @@ public class PendingReviewService {
 
         List<Email> remaining =
                 emailRepository
-                        .findByActionAndAiReviewedFalseOrderByIdAsc(
-                                "PENDING_REVIEW"
+                        .findByOwnerAndActionAndAiReviewedFalseOrderByIdAsc(
+                                owner, "PENDING_REVIEW"
                         );
 
 
@@ -707,7 +707,7 @@ public class PendingReviewService {
 
 
         for (Email candidate :
-                emailRepository.findAll()) {
+                emailRepository.findByOwnerOrderByIdAsc(owner)) {
 
             if (candidate == null ||
                     !"PENDING_REVIEW".equalsIgnoreCase(
@@ -754,7 +754,8 @@ public class PendingReviewService {
     // ============================================================
 
     private void waitForBatch(
-            List<Long> batchIds) {
+            List<Long> batchIds,
+            AppUser owner) {
 
         if (batchIds == null ||
                 batchIds.isEmpty()) {
@@ -782,9 +783,7 @@ public class PendingReviewService {
 
                 Email current =
                         emailRepository
-                                .findById(
-                                        emailId
-                                )
+                                .findByIdAndOwner(emailId, owner)
                                 .orElse(null);
 
 
@@ -808,7 +807,7 @@ public class PendingReviewService {
 
 
                 markBatchCompleted(
-                        batchIds
+                        batchIds, owner
                 );
 
 
@@ -848,9 +847,7 @@ public class PendingReviewService {
 
             Email current =
                     emailRepository
-                            .findById(
-                                    emailId
-                            )
+                            .findByIdAndOwner(emailId, owner)
                             .orElse(null);
 
 
@@ -885,7 +882,8 @@ public class PendingReviewService {
     // ============================================================
 
     private void markBatchCompleted(
-            List<Long> batchIds) {
+            List<Long> batchIds,
+            AppUser owner) {
 
 
         for (Long emailId :
@@ -894,9 +892,7 @@ public class PendingReviewService {
 
             Email current =
                     emailRepository
-                            .findById(
-                                    emailId
-                            )
+                            .findByIdAndOwner(emailId, owner)
                             .orElse(null);
 
 
@@ -924,9 +920,11 @@ public class PendingReviewService {
     // PROGRESS
     // ============================================================
 
-    public Map<String, Object> getProgress() {
-
-
+    public Map<String, Object> getProgress(AppUser owner) {
+        if (progressOwnerId != null && !progressOwnerId.equals(owner.getId())) {
+            return Map.of("processing", false, "stage", "IDLE", "backlogAtStart", 0,
+                    "total", 0, "submitted", 0, "completed", 0, "failed", 0);
+        }
         return Map.of(
                 "processing",
                 processing.get(),

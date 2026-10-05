@@ -540,6 +540,16 @@ SmartMail/
 
 SmartMail uses Google OAuth2 instead of Gmail passwords.
 
+### Multi-user account isolation
+
+- Google OpenID Connect `sub` is the stable account identity.
+- Each email row is linked to one SmartMail account; email reads, actions, and pending review queries are scoped to that owner.
+- Existing local email rows keep a nullable owner and are retained, but are not returned to signed-in users. Newly fetched rows are owner-linked.
+- For production, set the Render environment variable `SMARTMAIL_FRONTEND_URL` to `https://smart-mail-wheat.vercel.app` so OAuth returns to the deployed frontend. Local development defaults to `http://localhost:5173`.
+- The frontend sends a CSRF token for POST and DELETE operations. Keep the configured stable frontend origin in the backend CORS allowlist.
+
+Before describing a deployment as multi-user ready, verify with two separate Google accounts that each sees only its own emails, and that an account cannot fetch, keep, trash, or delete another account's email ID. Also verify that `/emails/gmail/results` returns `401` when signed out.
+
 Sensitive values such as:
 
 - Google OAuth client ID

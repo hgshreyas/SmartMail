@@ -1,9 +1,11 @@
 package com.smartmail.backend.model;
 
 import jakarta.persistence.*;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 
 @Entity
-@Table(name = "emails")
+@Table(name = "emails", uniqueConstraints =
+        @UniqueConstraint(name = "uk_emails_owner_gmail_message", columnNames = {"owner_id", "gmail_message_id"}))
 public class Email {
 
     @Id
@@ -28,6 +30,13 @@ public class Email {
     private boolean processed;
 
     private boolean aiReviewed;
+
+    // Nullable so existing local historical rows survive the migration.
+    // All new rows created through application code are assigned an owner.
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "owner_id")
+    @JsonIgnore
+    private AppUser owner;
 
     public Email() {
     }
@@ -107,4 +116,7 @@ public class Email {
     public void setAiReviewed(boolean aiReviewed) {
         this.aiReviewed = aiReviewed;
     }
+
+    public AppUser getOwner() { return owner; }
+    public void setOwner(AppUser owner) { this.owner = owner; }
 }

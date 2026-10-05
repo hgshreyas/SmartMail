@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8080";
@@ -14,9 +14,13 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [connected, setConnected] = useState(false);
   const [reviewProgress, setReviewProgress] = useState(null);
+  const [gmailProgress, setGmailProgress] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [csrfToken, setCsrfToken] = useState("");
 
-  const fetchEmails = async () => {
+  const fetchEmails = useCallback(async () => {
     try {
       const response = await fetch(
           `${API_BASE}/emails/gmail/results`,
@@ -25,6 +29,11 @@ function App() {
           }
       );
 
+      if (response.status === 401) {
+        setUser(null);
+        setEmails([]);
+        return;
+      }
       if (!response.ok) {
         throw new Error("Could not fetch emails from SmartMail backend.");
       }
@@ -46,9 +55,9 @@ function App() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const fetchReviewProgress = async () => {
+  const fetchReviewProgress = useCallback(async () => {
     try {
       const response = await fetch(
           `${API_BASE}/emails/pending-review/progress`,
@@ -67,6 +76,35 @@ function App() {
     } catch (err) {
       console.debug("Pending-review progress is unavailable.", err);
     }
+  }, []);
+
+  const fetchGmailProgress = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/emails/gmail/progress`, { credentials: "include" });
+      if (response.ok) setGmailProgress(await response.json());
+    } catch (err) {
+      console.debug("Gmail sync progress is unavailable.", err);
+    }
+  }, []);
+
+  const handleProcessReview = async () => {
+    try {
+      setRefreshing(true);
+      const response = await fetch(`${API_BASE}/emails/pending-review/process`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "X-XSRF-TOKEN": csrfToken },
+      });
+      if (!response.ok) throw new Error("Could not start AI review.");
+      const result = await response.json();
+      setReviewProgress(result.progress);
+      setError("");
+    } catch (err) {
+      console.error(err);
+      setError("Could not start the pending review processor.");
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   const handleRefresh = async () => {
@@ -76,6 +114,7 @@ function App() {
       await Promise.all([
         fetchEmails(),
         fetchReviewProgress(),
+        fetchGmailProgress(),
       ]);
     } finally {
       setRefreshing(false);
@@ -83,16 +122,46 @@ function App() {
   };
 
   useEffect(() => {
-    fetchEmails();
-    fetchReviewProgress();
+    let active = true;
+    const loadSession = async () => {
+      try {
+        const csrfResponse = await fetch(`${API_BASE}/api/csrf`, { credentials: "include" });
+        if (csrfResponse.ok) {
+          const csrfData = await csrfResponse.json();
+          if (active) setCsrfToken(csrfData.token || "");
+        }
+        const response = await fetch(`${API_BASE}/api/me`, { credentials: "include" });
+        if (response.ok) {
+          const profile = await response.json();
+          if (active) setUser(profile);
+        } else if (active) {
+          setUser(null);
+        }
+      } catch (err) {
+        console.error("Could not check SmartMail sign-in.", err);
+        if (active) setConnected(false);
+      } finally {
+        if (active) setAuthLoading(false);
+      }
+    };
+    loadSession();
+    return () => { active = false; };
+  }, []);
 
-    const interval = setInterval(() => {
+  useEffect(() => {
+    if (authLoading || !user) return undefined;
+    const poll = () => {
       fetchEmails();
       fetchReviewProgress();
-    }, 3000);
-
-    return () => clearInterval(interval);
-  }, []);
+      fetchGmailProgress();
+    };
+    const initialPoll = setTimeout(poll, 0);
+    const interval = setInterval(poll, 3000);
+    return () => {
+      clearTimeout(initialPoll);
+      clearInterval(interval);
+    };
+  }, [authLoading, user, fetchEmails, fetchReviewProgress, fetchGmailProgress]);
 
   /*
    * KEEP EMAIL
@@ -113,6 +182,7 @@ function App() {
           {
             method: "POST",
             credentials: "include",
+            headers: { "X-XSRF-TOKEN": csrfToken },
           }
       );
 
@@ -163,6 +233,7 @@ function App() {
           {
             method: "POST",
             credentials: "include",
+            headers: { "X-XSRF-TOKEN": csrfToken },
           }
       );
 
@@ -191,6 +262,42 @@ function App() {
 
     } finally {
       setActionLoading(false);
+    }
+  };
+
+  const handleSyncGmail = async () => {
+    try {
+      setRefreshing(true);
+      const response = await fetch(`${API_BASE}/emails/gmail/sync`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "X-XSRF-TOKEN": csrfToken },
+      });
+      if (!response.ok) throw new Error("Could not start Gmail sync.");
+      await fetchGmailProgress();
+      setError("");
+    } catch (err) {
+      console.error(err);
+      setError("Could not start Gmail sync. Please sign in again and retry.");
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/logout`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "X-XSRF-TOKEN": csrfToken },
+      });
+      if (!response.ok) throw new Error("Sign out was rejected.");
+      setUser(null);
+      setEmails([]);
+      setSelectedEmail(null);
+    } catch (err) {
+      console.error(err);
+      setError("Could not sign out. Please refresh and try again.");
     }
   };
 
@@ -349,6 +456,27 @@ function App() {
     );
   };
 
+  if (authLoading) {
+    return <div className="app"><main className="dashboard"><h2>Loading SmartMail...</h2></main></div>;
+  }
+
+  if (!user) {
+    return (
+      <div className="app">
+        <header className="topbar">
+          <div className="brand"><div className="brand-icon">✉</div><div><h1>SmartMail</h1><p>AI-Powered Gmail Assistant</p></div></div>
+        </header>
+        <main className="dashboard">
+          <section className="welcome">
+            <div><h2>Manage your inbox with confidence</h2><p>Sign in with Google to securely review and organize your Gmail.</p></div>
+            <button className="refresh-button" onClick={() => window.location.assign(`${API_BASE}/oauth2/authorization/google`)}>Sign in with Google</button>
+          </section>
+          <p>Your emails remain tied to your Google account and are not shared with other SmartMail users.</p>
+        </main>
+      </div>
+    );
+  }
+
   return (
       <div className="app">
 
@@ -372,6 +500,11 @@ function App() {
               </p>
             </div>
 
+          </div>
+
+          <div className="account-controls">
+            <span>{user.name || user.email}</span>
+            <button className="refresh-button" onClick={handleSignOut}>Sign out</button>
           </div>
 
           <div
@@ -410,6 +543,21 @@ function App() {
 
             </div>
 
+            <div className="welcome-actions">
+            <button
+                className="refresh-button"
+                onClick={handleSyncGmail}
+                disabled={refreshing || gmailProgress?.processing}
+            >
+              {gmailProgress?.processing ? formatStage(gmailProgress.stage) : "↻ Sync Gmail"}
+            </button>
+            <button
+                className="refresh-button"
+                onClick={handleProcessReview}
+                disabled={refreshing || reviewProgress?.processing}
+            >
+              {reviewProgress?.processing ? "Reviewing..." : "Run AI Review"}
+            </button>
             <button
                 className="refresh-button"
                 onClick={handleRefresh}
@@ -417,6 +565,7 @@ function App() {
             >
               {refreshing ? "Refreshing..." : "↻ Refresh"}
             </button>
+            </div>
 
           </section>
 

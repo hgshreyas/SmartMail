@@ -63,6 +63,19 @@
   font-weight: 650;
 }
 
+.account-controls,
+.welcome-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.account-controls > span {
+  color: #586276;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .connection-dot {
   width: 8px;
   height: 8px;
@@ -656,6 +669,10 @@
     padding: 0 18px;
   }
 
+  .account-controls > span {
+    display: none;
+  }
+
   .connection {
     display: none;
   }
@@ -669,6 +686,10 @@
     align-items: flex-start;
     gap: 15px;
     flex-direction: column;
+  }
+
+  .welcome-actions {
+    flex-wrap: wrap;
   }
 
   .stats {
