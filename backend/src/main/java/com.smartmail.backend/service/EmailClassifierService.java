@@ -1073,6 +1073,11 @@ public class EmailClassifierService {
             Consumer<Email> actionHandler) {
 
         String messageId = email.getGmailMessageId();
+        if (email.getOwner() == null) {
+            System.err.println("SmartMail: Refusing AI review for an unowned email.");
+            return;
+        }
+        String reviewKey = email.getOwner().getId() + ":" + messageId;
 
         /*
          * Already completed.
@@ -1110,7 +1115,7 @@ public class EmailClassifierService {
          * This prevents two simultaneous Ollama calls for the
          * same Gmail message.
          */
-        if (!aiReviewsInProgress.add(messageId)) {
+        if (!aiReviewsInProgress.add(reviewKey)) {
 
             System.out.println(
                     "SmartMail: AI review already in progress. " +
@@ -1128,7 +1133,7 @@ public class EmailClassifierService {
          */
         if (!aiReviewSlots.tryAcquire()) {
 
-            aiReviewsInProgress.remove(messageId);
+            aiReviewsInProgress.remove(reviewKey);
 
             System.out.println(
                     "SmartMail: Ollama concurrency limit reached. " +
@@ -1162,7 +1167,7 @@ public class EmailClassifierService {
         }
         catch (Exception e) {
 
-            aiReviewsInProgress.remove(messageId);
+            aiReviewsInProgress.remove(reviewKey);
             aiReviewSlots.release();
 
             System.err.println(
@@ -1202,14 +1207,14 @@ public class EmailClassifierService {
                             automatedSender,
                             domain,
                             actionHandler,
-                            messageId
+                            reviewKey
                     );
 
                     return;
                 }
 
-                emailRepository.findByGmailMessageId(
-                        messageId
+                emailRepository.findByOwnerAndGmailMessageId(
+                        email.getOwner(), messageId
                 ).ifPresentOrElse(
 
                         savedEmail -> {
@@ -1318,7 +1323,7 @@ public class EmailClassifierService {
                                 }
                             }
 
-                            aiRetryAttempts.remove(messageId);
+                            aiRetryAttempts.remove(reviewKey);
                         },
 
                         () -> {
@@ -1367,7 +1372,7 @@ public class EmailClassifierService {
                  * processing, so future page refreshes will still
                  * skip it.
                  */
-                aiReviewsInProgress.remove(messageId);
+                aiReviewsInProgress.remove(reviewKey);
             }
 
         }).exceptionally(error -> {
@@ -1379,7 +1384,7 @@ public class EmailClassifierService {
              * remove it from the in-progress set, a future attempt
              * is allowed.
              */
-            aiReviewsInProgress.remove(messageId);
+            aiReviewsInProgress.remove(reviewKey);
             aiReviewSlots.release();
 
             System.err.println(
@@ -1397,7 +1402,7 @@ public class EmailClassifierService {
                     automatedSender,
                     domain,
                     actionHandler,
-                    messageId
+                    reviewKey
             );
 
             return null;
@@ -1416,22 +1421,22 @@ public class EmailClassifierService {
             boolean automatedSender,
             String domain,
             Consumer<Email> actionHandler,
-            String messageId) {
+            String reviewKey) {
 
         int attempt =
                 aiRetryAttempts.merge(
-                        messageId,
+                        reviewKey,
                         1,
                         Integer::sum
                 );
 
         if (attempt > MAX_AI_RETRIES) {
 
-            aiRetryAttempts.remove(messageId);
+            aiRetryAttempts.remove(reviewKey);
 
             System.err.println(
                     "SmartMail: AI retry limit reached for " +
-                            messageId +
+                            reviewKey +
                             ". Leaving email PENDING_REVIEW."
             );
 
@@ -1444,7 +1449,7 @@ public class EmailClassifierService {
                         "/" +
                         MAX_AI_RETRIES +
                         " for " +
-                        messageId +
+                        reviewKey +
                         " in " +
                         AI_RETRY_DELAY_SECONDS +
                         " seconds."
