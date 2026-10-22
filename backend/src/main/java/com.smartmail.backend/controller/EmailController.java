@@ -72,7 +72,6 @@ public class EmailController {
     // attached to the signed-in account; clients cannot set or change its owner.
     @PostMapping
     public Email addEmail(@RequestBody Email email) {
-        email.setId(null);
         email.setOwner(currentUserService.get());
         return emailRepository.save(classifierService.classify(email));
     }
