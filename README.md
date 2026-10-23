@@ -545,7 +545,9 @@ SmartMail uses Google OAuth2 instead of Gmail passwords.
 - Google OpenID Connect `sub` is the stable account identity.
 - Each email row is linked to one SmartMail account; email reads, actions, and pending review queries are scoped to that owner.
 - Existing local email rows keep a nullable owner and are retained, but are not returned to signed-in users. Newly fetched rows are owner-linked.
-- For production, set the Render environment variable `SMARTMAIL_FRONTEND_URL` to `https://smart-mail-wheat.vercel.app` so OAuth returns to the deployed frontend. Local development defaults to `http://localhost:5173`.
+- The Render Docker image activates the `production` profile. It defaults OAuth's post-login redirect to `https://smart-mail-wheat.vercel.app`, honors Render's forwarded HTTPS headers, and sets secure `SameSite=None` session cookies so the Vercel frontend can keep the Render login session. Set `SMARTMAIL_FRONTEND_URL` on Render only if the frontend domain changes.
+- Local development keeps the `local` profile and redirects to `http://localhost:5173`.
+- In Google Cloud Console, add `https://smartmail-backend-l9sa.onrender.com/login/oauth2/code/google` as an authorized redirect URI for the OAuth web client. If the consent screen is in Testing mode, add every account that will test SmartMail to its Test users list; otherwise Google blocks those accounts before SmartMail can sign them in.
 - The frontend sends a CSRF token for POST and DELETE operations. Keep the configured stable frontend origin in the backend CORS allowlist.
 
 Before describing a deployment as multi-user ready, verify with two separate Google accounts that each sees only its own emails, and that an account cannot fetch, keep, trash, or delete another account's email ID. Also verify that `/emails/gmail/results` returns `401` when signed out.
