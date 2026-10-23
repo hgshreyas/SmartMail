@@ -17,6 +17,7 @@ WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
 
 ENV PORT=10000
+ENV SPRING_PROFILES_ACTIVE=production
 
 EXPOSE 10000
 
