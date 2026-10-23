@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
@@ -62,32 +63,9 @@ public class PendingReviewService {
     private final EmailRepository emailRepository;
     private final EmailClassifierService classifierService;
 
-    private final AtomicBoolean processing =
-            new AtomicBoolean(false);
-
-    /*
-     * Number of real emails selected for THIS run.
-     */
-    private final AtomicInteger total =
-            new AtomicInteger(0);
-
-    /*
-     * Full pending backlog size when the current run started.
-     */
-    private final AtomicInteger backlogAtStart =
-            new AtomicInteger(0);
-
-    private final AtomicInteger submitted =
-            new AtomicInteger(0);
-
-    private final AtomicInteger completed =
-            new AtomicInteger(0);
-
-    private final AtomicInteger failed =
-            new AtomicInteger(0);
-
-    private volatile String stage = "IDLE";
-    private volatile Long progressOwnerId;
+    // A long-running review for one account must not block another account.
+    private final ConcurrentHashMap<Long, ReviewRunState> runs = new ConcurrentHashMap<>();
+    private final ThreadLocal<ReviewRunState> currentRun = new ThreadLocal<>();
 
 
     public PendingReviewService(
@@ -103,7 +81,7 @@ public class PendingReviewService {
     // START BACKGROUND PROCESSING
     // ============================================================
 
-    public boolean startProcessing(
+    public synchronized boolean startProcessing(
             OAuth2AuthorizedClient authorizedClient,
             AppUser owner) {
 
@@ -114,25 +92,19 @@ public class PendingReviewService {
             );
         }
 
-        /*
-         * Prevent multiple pending-review workers from running
-         * at the same time.
-         */
-        if (!processing.compareAndSet(false, true)) {
-
+        Long ownerId = owner.getId();
+        ReviewRunState existingRun = runs.get(ownerId);
+        if (existingRun != null && existingRun.processing.get()) {
             return false;
         }
 
-        total.set(0);
-        backlogAtStart.set(0);
-        submitted.set(0);
-        completed.set(0);
-        failed.set(0);
-
-        stage = "STARTING";
-        progressOwnerId = owner.getId();
+        ReviewRunState run = new ReviewRunState();
+        run.processing.set(true);
+        run.stage = "STARTING";
+        runs.put(ownerId, run);
 
         CompletableFuture.runAsync(() -> {
+            currentRun.set(run);
 
             try {
 
@@ -143,7 +115,7 @@ public class PendingReviewService {
 
             } catch (Exception e) {
 
-                stage = "ERROR";
+                run.stage = "ERROR";
 
                 System.err.println(
                         "SmartMail: Pending-review processor failed: "
@@ -154,12 +126,13 @@ public class PendingReviewService {
 
             } finally {
 
-                processing.set(false);
+                run.processing.set(false);
 
-                if (!"ERROR".equals(stage)) {
+                if (!"ERROR".equals(run.stage)) {
 
-                    stage = "COMPLETE";
+                    run.stage = "COMPLETE";
                 }
+                currentRun.remove();
             }
         });
 
@@ -176,7 +149,7 @@ public class PendingReviewService {
             AppUser owner)
             throws Exception {
 
-        stage = "LOADING_PENDING_EMAILS";
+        progress().stage = "LOADING_PENDING_EMAILS";
 
         List<Email> pendingEmails =
                 new ArrayList<>();
@@ -231,7 +204,7 @@ public class PendingReviewService {
                 }
         );
 
-        backlogAtStart.set(
+        progress().backlogAtStart.set(
                 pendingEmails.size()
         );
 
@@ -243,9 +216,9 @@ public class PendingReviewService {
 
         if (pendingEmails.isEmpty()) {
 
-            total.set(0);
+            progress().total.set(0);
 
-            stage = "COMPLETE";
+            progress().stage = "COMPLETE";
 
             return;
         }
@@ -285,7 +258,7 @@ public class PendingReviewService {
             );
         }
 
-        total.set(
+        progress().total.set(
                 runEmails.size()
         );
 
@@ -302,7 +275,7 @@ public class PendingReviewService {
                             + "for pending-review processing."
             );
 
-            stage = "COMPLETE";
+            progress().stage = "COMPLETE";
 
             return;
         }
@@ -322,7 +295,7 @@ public class PendingReviewService {
         // RULE-FIRST REVIEW
         // ========================================================
 
-        stage = "RULE_FIRST_REVIEW";
+        progress().stage = "RULE_FIRST_REVIEW";
 
         List<Long> aiCandidateIds =
                 new ArrayList<>();
@@ -344,7 +317,7 @@ public class PendingReviewService {
             if (originalEmail == null ||
                     originalEmail.getId() == null) {
 
-                failed.incrementAndGet();
+                progress().failed.incrementAndGet();
 
                 continue;
             }
@@ -357,7 +330,7 @@ public class PendingReviewService {
 
             if (email == null) {
 
-                failed.incrementAndGet();
+                progress().failed.incrementAndGet();
 
                 continue;
             }
@@ -371,7 +344,7 @@ public class PendingReviewService {
                     email.getAction()
             )) {
 
-                completed.incrementAndGet();
+                progress().completed.incrementAndGet();
 
                 continue;
             }
@@ -407,7 +380,7 @@ public class PendingReviewService {
                                 + " has no Gmail message ID."
                 );
 
-                failed.incrementAndGet();
+                progress().failed.incrementAndGet();
 
                 continue;
             }
@@ -495,7 +468,7 @@ public class PendingReviewService {
 
                     rulesResolved++;
 
-                    completed.incrementAndGet();
+                    progress().completed.incrementAndGet();
 
                     System.out.println(
                             "SmartMail: Rules resolved backlog email "
@@ -540,7 +513,7 @@ public class PendingReviewService {
 
             } catch (Exception e) {
 
-                failed.incrementAndGet();
+                progress().failed.incrementAndGet();
 
                 System.err.println(
                         "SmartMail: Could not rule-review pending email "
@@ -594,7 +567,7 @@ public class PendingReviewService {
          *
          * Therefore Ollama remains strictly sequential.
          */
-        stage = "PROCESSING_AI_EMAILS";
+        progress().stage = "PROCESSING_AI_EMAILS";
 
 
         int aiCount =
@@ -673,7 +646,7 @@ public class PendingReviewService {
                     );
 
 
-            submitted.incrementAndGet();
+            progress().submitted.incrementAndGet();
 
 
             /*
@@ -859,13 +832,13 @@ public class PendingReviewService {
                                     ))) {
 
 
-                completed.incrementAndGet();
+                progress().completed.incrementAndGet();
 
 
             } else {
 
 
-                failed.incrementAndGet();
+                progress().failed.incrementAndGet();
 
 
                 System.err.println(
@@ -904,13 +877,13 @@ public class PendingReviewService {
                                     ))) {
 
 
-                completed.incrementAndGet();
+                progress().completed.incrementAndGet();
 
 
             } else {
 
 
-                failed.incrementAndGet();
+                progress().failed.incrementAndGet();
             }
         }
     }
@@ -921,32 +894,51 @@ public class PendingReviewService {
     // ============================================================
 
     public Map<String, Object> getProgress(AppUser owner) {
-        if (progressOwnerId != null && !progressOwnerId.equals(owner.getId())) {
+        ReviewRunState run = runs.get(owner.getId());
+        if (run == null) {
             return Map.of("processing", false, "stage", "IDLE", "backlogAtStart", 0,
                     "total", 0, "submitted", 0, "completed", 0, "failed", 0);
         }
         return Map.of(
                 "processing",
-                processing.get(),
+                run.processing.get(),
 
                 "stage",
-                stage,
+                run.stage,
 
                 "backlogAtStart",
-                backlogAtStart.get(),
+                run.backlogAtStart.get(),
 
                 "total",
-                total.get(),
+                run.total.get(),
 
                 "submitted",
-                submitted.get(),
+                run.submitted.get(),
 
                 "completed",
-                completed.get(),
+                run.completed.get(),
 
                 "failed",
-                failed.get()
+                run.failed.get()
         );
+    }
+
+    private ReviewRunState progress() {
+        ReviewRunState run = currentRun.get();
+        if (run == null) {
+            throw new IllegalStateException("No pending-review run is active on this thread.");
+        }
+        return run;
+    }
+
+    private static final class ReviewRunState {
+        private final AtomicBoolean processing = new AtomicBoolean(false);
+        private final AtomicInteger total = new AtomicInteger(0);
+        private final AtomicInteger backlogAtStart = new AtomicInteger(0);
+        private final AtomicInteger submitted = new AtomicInteger(0);
+        private final AtomicInteger completed = new AtomicInteger(0);
+        private final AtomicInteger failed = new AtomicInteger(0);
+        private volatile String stage = "IDLE";
     }
 
 
@@ -1328,10 +1320,10 @@ public class PendingReviewService {
 
 
         String previousStage =
-                stage;
+                progress().stage;
 
 
-        stage =
+        progress().stage =
                 "GMAIL_RATE_LIMIT_BACKOFF";
 
 
@@ -1353,7 +1345,7 @@ public class PendingReviewService {
         );
 
 
-        stage =
+        progress().stage =
                 previousStage;
     }
 
