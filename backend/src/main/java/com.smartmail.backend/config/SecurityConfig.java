@@ -79,7 +79,9 @@ public class SecurityConfig {
     private Consumer<OAuth2AuthorizationRequest.Builder> authorizationRequestCustomizer() {
         return customizer -> customizer.additionalParameters(parameters -> {
             parameters.put("access_type", "offline");
-            parameters.put("prompt", "consent");
+            // Let people choose the Google account when testing multiple users
+            // in the same browser. Consent is still requested for Gmail access.
+            parameters.put("prompt", "select_account consent");
             parameters.put("include_granted_scopes", "true");
         });
     }
