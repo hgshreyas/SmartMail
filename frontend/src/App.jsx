@@ -614,12 +614,27 @@ function App() {
                 <small>Review Processor</small>
 
                 <strong>
-                  {reviewProgress?.processing
+                  {reviewProgress?.stage === "AI_QUOTA_PAUSED"
+                      ? "AI Quota Paused"
+                      : reviewProgress?.processing
                       ? formatStage(reviewProgress.stage)
                       : "Idle"}
                 </strong>
               </div>
             </div>
+
+            {reviewProgress?.stage === "AI_QUOTA_PAUSED" && (
+              <div className="ai-quota-notice" role="status">
+                <strong>AI review paused: Google’s Gemini quota is exhausted.</strong>
+                <span>
+                  Your remaining emails are still queued. After Google’s quota
+                  resets, click Run AI Review to continue.
+                </span>
+                {reviewProgress?.pauseReason && (
+                  <span>{reviewProgress.pauseReason}</span>
+                )}
+              </div>
+            )}
 
             <div className="status-item status-updated">
               <div>

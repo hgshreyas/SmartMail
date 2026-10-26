@@ -856,6 +856,24 @@
   font-weight: 650;
 }
 
+.ai-quota-notice {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid #f0d28a;
+  border-radius: 10px;
+  background: #fff9e9;
+  color: #745411;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.ai-quota-notice strong {
+  color: #674900;
+}
+
 @media (max-width: 1000px) {
   .system-status {
     grid-template-columns: repeat(3, minmax(0, 1fr));
