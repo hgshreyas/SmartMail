@@ -6,6 +6,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -73,6 +75,12 @@ public class OllamaClassificationService {
     private final String geminiApiKey;
     private final String geminiModel;
 
+    private volatile long geminiPausedUntilMillis;
+    private volatile String geminiPauseReason = "";
+
+    private static final Pattern RETRY_DELAY_PATTERN =
+            Pattern.compile("\\\"retryDelay\\\"\\s*:\\s*\\\"(\\d+)s\\\"");
+
 
     public OllamaClassificationService() {
 
@@ -134,6 +142,18 @@ public class OllamaClassificationService {
                             + geminiModel
             );
         }
+    }
+
+    public boolean isAiAvailable() {
+        return !"gemini".equals(aiProvider)
+                || geminiPausedUntilMillis <= System.currentTimeMillis();
+    }
+
+    public String getAiPauseReason() {
+        if (isAiAvailable()) {
+            return "";
+        }
+        return geminiPauseReason;
     }
 
 
@@ -407,6 +427,24 @@ public class OllamaClassificationService {
         }
     }
 
+    private void pauseGeminiForQuota(String responseBody) {
+        long pauseMillis = 60_000L;
+        Matcher retryDelay = RETRY_DELAY_PATTERN.matcher(
+                responseBody == null ? "" : responseBody);
+        if (retryDelay.find()) {
+            try {
+                pauseMillis = Math.max(60_000L,
+                        Math.multiplyExact(Long.parseLong(retryDelay.group(1)), 1_000L));
+            } catch (ArithmeticException | NumberFormatException ignored) {
+                pauseMillis = 60_000L;
+            }
+        }
+        geminiPausedUntilMillis = System.currentTimeMillis() + pauseMillis;
+        geminiPauseReason = "Gemini quota limit reached. Try again after "
+                + java.time.Instant.ofEpochMilli(geminiPausedUntilMillis) + ".";
+        System.err.println("SmartMail: " + geminiPauseReason);
+    }
+
 
     // ============================================================
     // GEMINI
@@ -528,6 +566,10 @@ public class OllamaClassificationService {
 
 
             if (response.statusCode() != 200) {
+
+                if (response.statusCode() == 429) {
+                    pauseGeminiForQuota(response.body());
+                }
 
                 System.err.println(
                         "SmartMail Gemini HTTP error: "

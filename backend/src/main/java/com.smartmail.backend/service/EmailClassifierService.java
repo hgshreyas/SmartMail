@@ -57,6 +57,14 @@ public class EmailClassifierService {
         this.emailRepository = emailRepository;
     }
 
+    public boolean isAiProviderAvailable() {
+        return ollamaClassificationService.isAiAvailable();
+    }
+
+    public String getAiProviderPauseReason() {
+        return ollamaClassificationService.getAiPauseReason();
+    }
+
     public Email classify(Email email) {
         return classify(
                 email,
@@ -1072,6 +1080,11 @@ public class EmailClassifierService {
             String domain,
             Consumer<Email> actionHandler) {
 
+        if (!ollamaClassificationService.isAiAvailable()) {
+            System.out.println("SmartMail: AI review skipped because the provider is quota-paused.");
+            return;
+        }
+
         String messageId = email.getGmailMessageId();
         if (email.getOwner() == null) {
             System.err.println("SmartMail: Refusing AI review for an unowned email.");
@@ -1422,6 +1435,11 @@ public class EmailClassifierService {
             String domain,
             Consumer<Email> actionHandler,
             String reviewKey) {
+
+        if (!ollamaClassificationService.isAiAvailable()) {
+            aiRetryAttempts.remove(reviewKey);
+            return;
+        }
 
         int attempt =
                 aiRetryAttempts.merge(

@@ -128,7 +128,8 @@ public class PendingReviewService {
 
                 run.processing.set(false);
 
-                if (!"ERROR".equals(run.stage)) {
+                if (!"ERROR".equals(run.stage)
+                        && !"AI_QUOTA_PAUSED".equals(run.stage)) {
 
                     run.stage = "COMPLETE";
                 }
@@ -585,6 +586,11 @@ public class PendingReviewService {
              i < aiCount;
              i++) {
 
+            if (!classifierService.isAiProviderAvailable()) {
+                progress().stage = "AI_QUOTA_PAUSED";
+                break;
+            }
+
 
             final Long selectedId =
                     aiCandidateIds.get(
@@ -652,9 +658,13 @@ public class PendingReviewService {
             /*
              * Wait for THIS email before submitting another one.
              */
-            waitForBatch(
+            boolean quotaPaused = waitForBatch(
                     List.of(selectedId), owner
             );
+            if (quotaPaused) {
+                progress().stage = "AI_QUOTA_PAUSED";
+                break;
+            }
         }
 
 
@@ -726,14 +736,14 @@ public class PendingReviewService {
     // WAIT FOR CURRENT AI EMAIL
     // ============================================================
 
-    private void waitForBatch(
+    private boolean waitForBatch(
             List<Long> batchIds,
             AppUser owner) {
 
         if (batchIds == null ||
                 batchIds.isEmpty()) {
 
-            return;
+            return false;
         }
 
 
@@ -744,6 +754,11 @@ public class PendingReviewService {
 
         while (System.currentTimeMillis()
                 < deadline) {
+
+            if (!classifierService.isAiProviderAvailable()) {
+                progress().stage = "AI_QUOTA_PAUSED";
+                return true;
+            }
 
 
             boolean allFinished =
@@ -784,7 +799,7 @@ public class PendingReviewService {
                 );
 
 
-                return;
+                return false;
             }
 
 
@@ -847,6 +862,7 @@ public class PendingReviewService {
                 );
             }
         }
+        return false;
     }
 
 
@@ -919,7 +935,12 @@ public class PendingReviewService {
                 run.completed.get(),
 
                 "failed",
-                run.failed.get()
+                run.failed.get(),
+
+                "pauseReason",
+                "AI_QUOTA_PAUSED".equals(run.stage)
+                        ? classifierService.getAiProviderPauseReason()
+                        : ""
         );
     }
 
