@@ -126,22 +126,35 @@ function App() {
   useEffect(() => {
     let active = true;
     const loadSession = async () => {
+      // Never leave the whole app stuck on "Loading SmartMail..." if Render
+      // is waking up, unreachable, or a cross-site session request hangs.
+      const requestOptions = {
+        credentials: "include",
+        signal: AbortSignal.timeout(12000),
+      };
       try {
-        const csrfResponse = await fetch(`${API_BASE}/api/csrf`, { credentials: "include" });
+        const csrfResponse = await fetch(`${API_BASE}/api/csrf`, requestOptions);
         if (csrfResponse.ok) {
           const csrfData = await csrfResponse.json();
           if (active) setCsrfToken(csrfData.token || "");
         }
-        const response = await fetch(`${API_BASE}/api/me`, { credentials: "include" });
+        const response = await fetch(`${API_BASE}/api/me`, requestOptions);
         if (response.ok) {
           const profile = await response.json();
           if (active) setUser(profile);
         } else if (active) {
           setUser(null);
+          if (response.status !== 401) {
+            setError(`SmartMail sign-in check failed (HTTP ${response.status}). Please try again.`);
+          }
         }
       } catch (err) {
         console.error("Could not check SmartMail sign-in.", err);
-        if (active) setConnected(false);
+        if (active) {
+          setConnected(false);
+          setUser(null);
+          setError("SmartMail backend did not respond in time. Please wait a moment and try signing in again.");
+        }
       } finally {
         if (active) setAuthLoading(false);
       }
@@ -473,6 +486,7 @@ function App() {
             <div><h2>Manage your inbox with confidence</h2><p>Sign in with Google to securely review and organize your Gmail.</p></div>
             <button className="refresh-button" onClick={() => window.location.assign(`${API_BASE}/oauth2/authorization/google`)}>Sign in with Google</button>
           </section>
+          {error && <p role="alert">{error}</p>}
           <p>Your emails remain tied to your Google account and are not shared with other SmartMail users.</p>
         </main>
       </div>
